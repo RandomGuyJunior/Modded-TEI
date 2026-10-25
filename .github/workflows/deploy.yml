@@ -1,0 +1,67 @@
+name: Deploy TEI to VM
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'lib/**'
+      - 'assets/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: modded-tei-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_KEY" && test -n "$SSH_KNOWN_HOSTS"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+      - name: Verify VM safety checks
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOST"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "yquestmastery@$DEPLOY_HOST" \
+            'test -d "$HOME/BAR-Devtools/teiserver/lib" &&
+             test -d "$HOME/BAR-Devtools/teiserver/assets" &&
+             test "$(podman inspect --format "{{.State.Running}}" bar-devtools-teiserver-1)" = true &&
+             podman exec bar-devtools-teiserver-1 test -f /app/.devtools/.initialized'
+      - name: Transfer runtime code only
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          # No compose, config, env, credentials, database, or volumes are sent.
+          tar --exclude='*.env' --exclude='*.secret.exs' \
+              --exclude='lib/teiserver/account/account_import.ex' \
+              --exclude='assets/node_modules' \
+              -cf - lib assets | \
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              "yquestmastery@$DEPLOY_HOST" \
+              'tar -xf - -C "$HOME/BAR-Devtools/teiserver" --no-same-owner --no-same-permissions'
+      - name: Restart existing TEI container
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "yquestmastery@$DEPLOY_HOST" \
+            'podman restart bar-devtools-teiserver-1 >/dev/null &&
+             test "$(podman inspect --format "{{.State.Running}}" bar-devtools-teiserver-1)" = true'

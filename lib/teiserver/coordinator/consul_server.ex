@@ -77,7 +77,7 @@ defmodule Teiserver.Coordinator.ConsulServer do
 
   def handle_call(:get_chobby_extra_data, _from, state) do
     keys =
-      ~w(gatekeeper minimum_rating_to_play maximum_rating_to_play minimum_rank_to_play maximum_rank_to_play minimum_skill_to_play maximum_skill_to_play welcome_message player_limit mod_hub_capabilities)a
+      ~w(gatekeeper minimum_rating_to_play maximum_rating_to_play minimum_rank_to_play maximum_rank_to_play minimum_skill_to_play maximum_skill_to_play welcome_message player_limit mod_hub_capabilities mod_hub_downloaded)a
 
     result =
       state
@@ -97,6 +97,14 @@ defmodule Teiserver.Coordinator.ConsulServer do
     if userid == state.host_id and
          capabilities == ["rapid-mods-v1"] do
       {:noreply, Map.put(state, :mod_hub_capabilities, capabilities)}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_info({:register_mod_inventory, userid, tags}, state) do
+    if userid == state.host_id and Map.get(state, :mod_hub_capabilities) == ["rapid-mods-v1"] do
+      {:noreply, Map.put(state, :mod_hub_downloaded, tags)}
     else
       {:noreply, state}
     end

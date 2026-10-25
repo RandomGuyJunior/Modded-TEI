@@ -82,7 +82,7 @@ defmodule Teiserver.Protocols.Spring.BattleIn do
   def do_handle("mod_inventory", data, _msg_id,
         %{lobby_id: lobby_id, lobby_host: true, userid: userid} = state)
       when is_integer(lobby_id) and is_binary(data) and byte_size(data) <= 8192 do
-    tags = if data == "", do: [], else: String.split(data, ",")
+    tags = if data in ["", "-"], do: [], else: String.split(data, ",")
     if length(tags) <= 128 and Enum.all?(tags, &Regex.match?(~r/\A[A-Za-z0-9_-]+:[A-Za-z0-9_-]+\z/, &1)) do
       Coordinator.cast_consul(lobby_id, {:register_mod_inventory, userid, tags})
     end

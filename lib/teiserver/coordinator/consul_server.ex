@@ -103,7 +103,7 @@ defmodule Teiserver.Coordinator.ConsulServer do
   end
 
   def handle_info({:register_mod_inventory, userid, tags}, state) do
-    if userid == state.host_id and Map.get(state, :mod_hub_capabilities) == ["rapid-mods-v1"] do
+    if userid == state.host_id do
       {:noreply, Map.put(state, :mod_hub_downloaded, tags)}
     else
       {:noreply, state}

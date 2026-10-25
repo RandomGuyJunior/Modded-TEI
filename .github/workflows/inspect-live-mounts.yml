@@ -1,0 +1,42 @@
+name: Inspect live TEI mounts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+      - name: Inspect container without changes
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "yquestmastery@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          echo "=== Live container mount paths ==="
+          podman inspect bar-devtools-teiserver-1 --format '{{range .Mounts}}{{println .Source " -> " .Destination}}{{end}}'
+          echo "=== Live directory ==="
+          ls -ld "$HOME/BAR-Devtools/teiserver" "$HOME/BAR-Devtools/teiserver/lib" "$HOME/BAR-Devtools/teiserver/assets"
+          echo "=== Database initialization marker ==="
+          if podman exec bar-devtools-teiserver-1 test -f /app/.devtools/.initialized; then
+            echo "INITIALIZATION_MARKER_PRESENT"
+          else
+            echo "INITIALIZATION_MARKER_MISSING"
+          fi
+          REMOTE

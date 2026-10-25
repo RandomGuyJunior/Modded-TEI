@@ -33,23 +33,35 @@ jobs:
           chmod 600 "$HOME/.ssh/id_ed25519"
           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
-      - name: Verify VM safety checks
+      - name: Validate live server and bind mounts
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           set -euo pipefail
           test -n "$DEPLOY_HOST"
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "yquestmastery@$DEPLOY_HOST" \
-            'test -d "$HOME/BAR-Devtools/teiserver/lib" &&
-             test -d "$HOME/BAR-Devtools/teiserver/assets" &&
-             test "$(podman inspect --format "{{.State.Running}}" bar-devtools-teiserver-1)" = true &&
-             podman exec bar-devtools-teiserver-1 test -f /app/.devtools/.initialized'
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 \
+            "yquestmastery@$DEPLOY_HOST" 'python3 -' <<'PY'
+          import json, os, subprocess, sys
+          container = "bar-devtools-teiserver-1"
+          base = os.path.realpath(os.path.expanduser("~/BAR-Devtools/teiserver"))
+          inspect = json.loads(subprocess.check_output(["podman", "inspect", container], text=True))[0]
+          if not inspect["State"]["Running"]:
+              sys.exit("Refusing deployment: container is not running")
+          mounts = {m["Destination"]: os.path.realpath(m["Source"]) for m in inspect["Mounts"]}
+          for directory in ("lib", "assets"):
+              expected = os.path.join(base, directory)
+              if mounts.get("/app/" + directory) != expected or not os.path.isdir(expected):
+                  sys.exit("Refusing deployment: unexpected " + directory + " bind mount")
+          marker = subprocess.run(["podman", "exec", container, "test", "-f", "/app/.devtools/.initialized"])
+          if marker.returncode:
+              sys.exit("Refusing deployment: first-run database marker missing")
+          print("Live mounts and database safeguard verified")
+          PY
       - name: Transfer runtime code only
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           set -euo pipefail
-          # No compose, config, env, credentials, database, or volumes are sent.
           tar --exclude='*.env' --exclude='*.secret.exs' \
               --exclude='lib/teiserver/account/account_import.ex' \
               --exclude='assets/node_modules' \

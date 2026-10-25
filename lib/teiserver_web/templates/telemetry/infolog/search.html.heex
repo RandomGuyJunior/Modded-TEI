@@ -1,0 +1,96 @@
+<% {_fg, _bg, bsname} = view_colour() |> colours() %>
+
+<div class="search-row pt-3">
+  <div class={"btn btn-outline-#{bsname}"} onclick="show_search();" id="search-box-shower">
+    <i class="fa-solid fa-fw fa-search"></i> Show search form
+  </div>
+
+  <form
+    action={~p"/telemetry/infolog"}
+    method="get"
+    class="form-horizontal"
+    id="search-box"
+    style="display: none;"
+  >
+    <div class="row">
+      <div class="col-md-4 col-lg-3 col-xl-2 my-2">
+        <.input
+          type="select"
+          id="search_type"
+          name="type"
+          label="Type"
+          value={@params["type"] || "Any"}
+          options={[
+            "Any",
+            "LuaUI",
+            "LuaRules",
+            "SyncError",
+            "Errorlog",
+            "EngineCrash",
+            "AICrash",
+            "LuaMenu"
+          ]}
+        />
+      </div>
+
+      <div class="col-md-4 col-lg-3 col-xl-2 my-2">
+        <.input
+          type="select"
+          id="search_order"
+          name="search[order]"
+          label="Order by"
+          value={@params["order"] || "Name (A-Z)"}
+          options={[
+            "Newest first",
+            "Oldest first",
+            "Largest first",
+            "Smallest first"
+          ]}
+        />
+      </div>
+
+      <div class="col-md-4 col-lg-3 col-xl-2 my-2">
+        <label for="search_engine" class="control-label">Engine: </label>
+        <input
+          type="text"
+          name="engine"
+          id="search_engine"
+          value={@params["engine"]}
+          placeholder=""
+          class="form-control"
+        />
+      </div>
+
+      <div class="col-md-4 col-lg-3 col-xl-2 my-2">
+        <label for="search_game" class="control-label">Game: </label>
+        <input
+          type="text"
+          name="game"
+          id="search_game"
+          value={@params["game"]}
+          placeholder=""
+          class="form-control"
+        />
+      </div>
+
+      <div class="col-md-4 col-lg-3 col-xl-2 my-2">
+        <label for="search_shorterror" class="control-label">Errorcode: </label>
+        <input
+          type="text"
+          name="shorterror"
+          id="search_shorterror"
+          value={@params["shorterror"]}
+          placeholder=""
+          class="form-control"
+        />
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="offset-md-8 col-md-4 offset-xl-10 col-xl-2">
+        &nbsp;<br />
+        <input type="submit" value="Search" class={"btn btn-#{bsname} btn-block"} />
+      </div>
+    </div>
+  </form>
+</div>

@@ -1,0 +1,64 @@
+<% {_fg, _bg, bsname} = view_colour() |> colours() %>
+
+<script type="text/javascript" charset="utf-8">
+  $(function() {
+    $('.datepicker').datepicker({
+      format: "dd/mm/yyyy"
+    });
+  });
+</script>
+
+<div class="search-row">
+  <form
+    action={~p"/moderation/action"}
+    method="get"
+    class="form-horizontal"
+    id="search-box"
+  >
+    <input type="hidden" name="search" value="true" />
+    <input type="hidden" name="limit" value={@params["limit"] || "50"} />
+
+    <div class="row">
+      <div class="col-md-4 col-xl-2 search-form-input">
+        <.input
+          type="select"
+          id="search_expiry"
+          name="expiry"
+          label="Expiry"
+          value={@params["expiry"] || "All"}
+          options={[
+            "All",
+            "Completed only",
+            "Unexpired only",
+            "Unexpired not permanent",
+            "Permanent only",
+            "All active"
+          ]}
+        />
+      </div>
+
+      <div class="col-md-4 col-xl-2 search-form-input">
+        <.input
+          type="select"
+          id="search_order"
+          name="order"
+          label="Order by"
+          value={@params["state"] || "Open"}
+          options={[
+            "Most recently inserted first",
+            "Oldest inserted first",
+            "Earliest expiry first",
+            "Latest expiry first"
+          ]}
+        />
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="offset-md-8 col-md-4 offset-xl-10 col-xl-2">
+        &nbsp;<br />
+        <input type="submit" value="Search" class={"btn btn-#{bsname} btn-block"} />
+      </div>
+    </div>
+  </form>
+</div>

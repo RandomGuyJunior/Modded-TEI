@@ -1,0 +1,258 @@
+defmodule Teiserver.Matchmaking.QueueTest do
+  alias Teiserver.Helpers.GeneralTestLib
+  alias Teiserver.Matchmaking
+  alias Teiserver.Matchmaking.PairingRoom
+  alias Teiserver.Matchmaking.QueueServer
+  alias Teiserver.Player.SessionRegistry
+  alias Teiserver.Support.Polling
+  alias Teiserver.Support.Tachyon.Matchmaking, as: SupportMM
+  use Teiserver.DataCase
+
+  @moduletag :tachyon
+
+  setup _context do
+    user = mk_user()
+    %{state: initial_state, id: id, pid: pid} = SupportMM.start_queue()
+    map = List.first(initial_state.queue.maps)
+
+    {:ok,
+     user: user, queue_id: id, queue_pid: pid, version: initial_state.queue.version, map: map}
+  end
+
+  describe "listing" do
+    test "has correct data", %{queue_id: queue_id, map: map} do
+      queues =
+        Polling.poll_until(
+          fn -> Matchmaking.list_queues() |> Enum.into(%{}) end,
+          fn queues ->
+            is_map_key(queues, queue_id) && queues[queue_id].maps != []
+          end
+        )
+
+      assert queues[queue_id].maps == [map]
+    end
+  end
+
+  describe "joining" do
+    test "works", %{user: user, queue_id: queue_id, version: version} do
+      assert {:ok, _pid} = Matchmaking.join_queue(queue_id, version, user.id)
+
+      assert {:error, :already_queued} == Matchmaking.join_queue(queue_id, version, user.id)
+    end
+
+    test "invalid queue", %{user: user, version: version} do
+      assert {:error, :invalid_queue} == Matchmaking.join_queue("INVALID!!", version, user.id)
+    end
+
+    test "invalid version", %{user: user, queue_id: queue_id} do
+      assert {:error, :version_mismatch} == Matchmaking.join_queue(queue_id, "INVALID!!", user.id)
+    end
+
+    test "paired user still in queue", %{
+      user: user,
+      queue_id: queue_id,
+      queue_pid: queue_pid,
+      version: version
+    } do
+      user2 = mk_user()
+      assert {:ok, ^queue_pid} = Matchmaking.join_queue(queue_id, version, user.id)
+      assert {:ok, ^queue_pid} = Matchmaking.join_queue(queue_id, version, user2.id)
+      QueueServer.match_players(queue_pid)
+      assert {:error, :already_queued} == Matchmaking.join_queue(queue_id, version, user.id)
+    end
+  end
+
+  describe "pairing" do
+    test "get event when paired", %{user: user, queue_id: queue_id, version: version} do
+      user2 = mk_user()
+      assert {:ok, queue_pid} = Matchmaking.join_queue(queue_id, version, user.id)
+      assert {:ok, _data} = Matchmaking.join_queue(queue_id, version, user2.id)
+      QueueServer.match_players(queue_pid)
+
+      assert_receive {:"$gen_cast",
+                      {:matchmaking, {:notify_found, ^queue_id, _room_pid, _timeout}}}
+
+      assert_receive {:"$gen_cast",
+                      {:matchmaking, {:notify_found, ^queue_id, _room_pid, _timeout}}}
+    end
+
+    test "get `lost` event when peer decline", %{user: user, queue_id: queue_id, version: version} do
+      user2 = mk_user(register?: false)
+      assert {:ok, queue_pid} = Matchmaking.join_queue(queue_id, version, user.id)
+      assert {:ok, _data} = Matchmaking.join_queue(queue_id, version, user2.id)
+      QueueServer.match_players(queue_pid)
+
+      assert_receive {:"$gen_cast",
+                      {:matchmaking, {:notify_found, ^queue_id, room_pid, _timeout}}}
+
+      Matchmaking.cancel(room_pid, user2.id)
+      assert_receive {:"$gen_cast", {:matchmaking, {:lost, :cancel}}}
+    end
+
+    test "get `lost` event when peer decline after ready", %{
+      user: user,
+      queue_id: queue_id,
+      version: version
+    } do
+      user2 = mk_user()
+      assert {:ok, queue_pid} = Matchmaking.join_queue(queue_id, version, user.id)
+      assert {:ok, _data} = Matchmaking.join_queue(queue_id, version, user2.id)
+      QueueServer.match_players(queue_pid)
+
+      assert_receive {:"$gen_cast",
+                      {:matchmaking, {:notify_found, ^queue_id, room_pid, _timeout}}}
+
+      Matchmaking.ready(room_pid, %{user_id: user.id, name: user.name, password: "foo123"})
+      assert_receive {:"$gen_cast", {:matchmaking, {:found_update, 1, _room_pid}}}
+      Matchmaking.cancel(room_pid, user2.id)
+      assert_receive {:"$gen_cast", {:matchmaking, {:lost, :cancel}}}
+    end
+
+    test "both player get lost when timeout", %{user: user, queue_id: queue_id, version: version} do
+      user2 = mk_user()
+      assert {:ok, queue_pid} = Matchmaking.join_queue(queue_id, version, user.id)
+      assert {:ok, _data} = Matchmaking.join_queue(queue_id, version, user2.id)
+      QueueServer.match_players(queue_pid)
+
+      assert_receive {:"$gen_cast",
+                      {:matchmaking, {:notify_found, ^queue_id, room_pid, _timeout}}}
+
+      Matchmaking.ready(room_pid, %{user_id: user.id, name: user.name, password: "foo123"})
+      PairingRoom.timeout(room_pid)
+      assert_receive {:"$gen_cast", {:matchmaking, {:lost, :timeout}}}
+      assert_receive {:"$gen_cast", {:matchmaking, {:lost, :timeout}}}
+    end
+  end
+
+  describe "leaving" do
+    test "works", %{user: user, queue_id: queue_id, version: version} do
+      assert {:error, :not_queued} = Matchmaking.leave_queue(queue_id, user.id)
+
+      assert {:error, :invalid_queue} =
+               Matchmaking.leave_queue("lolnope that't not a queue", user.id)
+
+      {:ok, _pid} = Matchmaking.join_queue(queue_id, version, user.id)
+      assert :ok = Matchmaking.leave_queue(queue_id, user.id)
+    end
+  end
+
+  describe "queue statistics" do
+    test "initial stats are zero", %{queue_id: queue_id} do
+      # Initially stats should be zero
+      {:ok, stats} = Matchmaking.get_stats(queue_id)
+
+      assert stats == %{
+               total_joined: 0,
+               total_left: 0,
+               total_matched: 0,
+               total_wait_time_s: 0,
+               player_count: 0
+             }
+    end
+
+    test "tracks joins and leaves", %{user: user, queue_id: queue_id, version: version} do
+      # Initially stats should be zero
+      {:ok, stats} = Matchmaking.get_stats(queue_id)
+
+      assert stats == %{
+               total_joined: 0,
+               total_left: 0,
+               total_matched: 0,
+               total_wait_time_s: 0,
+               player_count: 0
+             }
+
+      # Join the queue
+      {:ok, _pid} = Matchmaking.join_queue(queue_id, version, user.id)
+      {:ok, stats} = Matchmaking.get_stats(queue_id)
+
+      assert stats == %{
+               total_joined: 1,
+               total_left: 0,
+               total_matched: 0,
+               total_wait_time_s: 0,
+               player_count: 1
+             }
+
+      # Leave the queue
+      :ok = Matchmaking.leave_queue(queue_id, user.id)
+      {:ok, stats} = Matchmaking.get_stats(queue_id)
+
+      assert stats == %{
+               total_joined: 1,
+               total_left: 1,
+               total_matched: 0,
+               total_wait_time_s: 0,
+               player_count: 0
+             }
+    end
+
+    test "tracks party joins", %{queue_id: queue_id, version: version} do
+      user1 = mk_user()
+      party_id = UUID.uuid4()
+
+      # Create a party with 1 player (valid for team_size: 1 queue)
+      {:ok, _pid} = Matchmaking.party_join_queue(queue_id, version, party_id, [user1.id])
+      {:ok, stats} = Matchmaking.get_stats(queue_id)
+      # No stats updated yet, party is pending
+      assert stats == %{
+               total_joined: 0,
+               total_left: 0,
+               total_matched: 0,
+               total_wait_time_s: 0,
+               player_count: 0
+             }
+
+      # Now actually join the queue with the party
+      {:ok, _pid} = Matchmaking.join_queue(queue_id, version, user1.id, party_id)
+      {:ok, stats} = Matchmaking.get_stats(queue_id)
+      # Now the player has joined
+      assert stats == %{
+               total_joined: 1,
+               total_left: 0,
+               total_matched: 0,
+               total_wait_time_s: 0,
+               player_count: 1
+             }
+    end
+
+    test "tracks wait time when matches are created", %{
+      queue_id: queue_id,
+      queue_pid: queue_pid,
+      version: version
+    } do
+      user1 = mk_user()
+      user2 = mk_user()
+
+      # Join first user
+      {:ok, _pid} = Matchmaking.join_queue(queue_id, version, user1.id)
+      {:ok, stats} = Matchmaking.get_stats(queue_id)
+
+      assert stats == %{
+               total_joined: 1,
+               total_left: 0,
+               total_matched: 0,
+               total_wait_time_s: 0,
+               player_count: 1
+             }
+
+      # Join second user (this should trigger a match)
+      {:ok, _pid} = Matchmaking.join_queue(queue_id, version, user2.id)
+
+      QueueServer.match_players(queue_pid)
+
+      # Check that wait time was recorded
+      {:ok, stats} = Matchmaking.get_stats(queue_id)
+      assert stats.total_joined == 2
+      assert stats.total_matched == 1
+      # Wait time should be calculated based on the time we passed
+      assert stats.total_wait_time_s >= 0
+    end
+  end
+
+  defp mk_user(opts \\ []) do
+    user = GeneralTestLib.make_user()
+    if Keyword.get(opts, :register?, true), do: SessionRegistry.register(user.id, nil)
+    user
+  end
+end

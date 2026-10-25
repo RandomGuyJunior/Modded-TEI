@@ -1,0 +1,154 @@
+defmodule Teiserver.Account.LoginThrottleServerTest do
+  @moduledoc false
+
+  alias Teiserver.Account
+  alias Teiserver.Account.Auth
+  alias Teiserver.Account.LoginThrottleServer
+  use Teiserver.DataCase, async: false
+
+  import Teiserver.TeiserverTestLib,
+    only: [
+      new_user: 0
+    ]
+
+  setup _ctx do
+    LoginThrottleServer.restart()
+    :ok = Supervisor.terminate_child(Teiserver.Supervisor, Teiserver.ClientRegistry)
+    Supervisor.restart_child(Teiserver.Supervisor, Teiserver.ClientRegistry)
+
+    LoginThrottleServer.set_tick_period(:infinity)
+    # ensure the rate limiter doesn't interfere with any tests
+    LoginThrottleServer.reset_rate_limiter(1000, true)
+  end
+
+  test "can stop user from login" do
+    user = new_user()
+    set_capacity(0)
+    assert LoginThrottleServer.attempt_login(self(), user.id) == false
+    refute_receive {:login_accepted, _}, 5
+  end
+
+  test "bots ignore limits" do
+    bot = new_user()
+    bot_id = bot.id
+    Auth.add_roles(bot.id, ["Bot"])
+    set_capacity(0)
+    assert LoginThrottleServer.attempt_login(self(), bot_id) == true
+  end
+
+  test "can immediately log in when there is capacity" do
+    user = new_user()
+    set_capacity(1)
+    assert LoginThrottleServer.attempt_login(self(), user.id) == true
+  end
+
+  test "can login when capacity becomes available" do
+    user = new_user()
+    set_capacity(0)
+    assert LoginThrottleServer.attempt_login(self(), user.id) == false
+    assert LoginThrottleServer.get_queue_length() == 1
+    set_capacity(1)
+    LoginThrottleServer.tick()
+    assert_receive {:login_accepted, _}, 5
+  end
+
+  test "works with many players" do
+    {user1, t1} = {new_user(), oneshot_pid()}
+    {user2, t2} = {new_user(), oneshot_pid()}
+    user3 = new_user()
+
+    set_capacity(0)
+    assert LoginThrottleServer.attempt_login(t1.pid, user1.id) == false
+    assert LoginThrottleServer.attempt_login(t2.pid, user2.id) == false
+    assert LoginThrottleServer.attempt_login(self(), user3.id) == false
+    assert LoginThrottleServer.get_queue_length() == 3
+
+    set_capacity(2)
+    LoginThrottleServer.tick()
+
+    assert_receive {:login_accepted, id1}, 5
+    assert_receive {:login_accepted, id2}, 5
+    # the messages are coming from tasks, so their order depends on the scheduler
+    assert MapSet.new([id1, id2]) == MapSet.new([user1.id, user2.id])
+    refute_receive {:login_accepted, _}, 5
+  end
+
+  test "ignore players that have disconnected" do
+    {user1, t1} = {new_user(), oneshot_pid()}
+    user2 = new_user()
+
+    set_capacity(0)
+    assert LoginThrottleServer.attempt_login(t1.pid, user1.id) == false
+    assert LoginThrottleServer.attempt_login(self(), user2.id) == false
+    assert LoginThrottleServer.get_queue_length() == 2
+
+    set_capacity(1)
+    send(t1.pid, nil)
+    Task.await(t1)
+    # now, t1 is dead
+
+    # members aren't cleaned up when DOWN is received
+    assert LoginThrottleServer.get_queue_length() == 2
+
+    # attempt to alleviate a potential race, where the DOWN message from the
+    # task reach the throttling server too late
+    :timer.sleep(5)
+    LoginThrottleServer.tick()
+
+    assert_receive {:login_accepted, id}, 5
+    assert user2.id == id
+  end
+
+  test "respect rate limiter" do
+    LoginThrottleServer.reset_rate_limiter(1, true)
+    {user1, t1} = {new_user(), oneshot_pid()}
+    user2 = new_user()
+
+    set_capacity(0)
+    assert LoginThrottleServer.attempt_login(t1.pid, user1.id) == false
+    assert LoginThrottleServer.attempt_login(self(), user2.id) == false
+    assert LoginThrottleServer.get_queue_length() == 2
+
+    set_capacity(2)
+    LoginThrottleServer.tick()
+
+    assert_receive {:login_accepted, id}, 5
+    assert id == user1.id
+    refute_receive {:login_accepted, _}, 5
+    assert LoginThrottleServer.get_queue_length() == 1
+  end
+
+  test "respect rate limiter even when there is capacity" do
+    LoginThrottleServer.reset_rate_limiter(1, false)
+    {user1, t1} = {new_user(), oneshot_pid()}
+    {user2, t2} = {new_user(), oneshot_pid()}
+
+    bot = new_user()
+    Auth.add_roles(bot.id, ["Bot"])
+
+    set_capacity(100)
+    assert LoginThrottleServer.attempt_login(t1.pid, user1.id) == true
+    assert LoginThrottleServer.attempt_login(t2.pid, user2.id) == false
+    assert LoginThrottleServer.get_queue_length() == 1
+
+    # bots do ignore rate limits
+    assert LoginThrottleServer.attempt_login(self(), bot.id) == true
+  end
+
+  defp set_capacity(n) do
+    # this is a hack because there seems to be some flakyness with `count_client`
+    # from other tests
+    current_count = Account.count_non_bot_clients()
+    LoginThrottleServer.set_login_limit(current_count + n)
+  end
+
+  defp oneshot_pid do
+    parent = self()
+
+    Task.async(fn ->
+      receive do
+        x -> send(parent, x)
+      end
+    end)
+  end
+end

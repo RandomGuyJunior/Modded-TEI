@@ -1,0 +1,57 @@
+<% {_fg, _bg, bsname} = view_colour() |> colours() %>
+
+<script type="text/javascript" charset="utf-8">
+  $(function() {
+    $('.datepicker').datepicker({
+      format: "dd/mm/yyyy"
+    });
+  });
+</script>
+
+<div class="search-row">
+  <form
+    action={~p"/moderation/ban"}
+    method="get"
+    class="form-horizontal"
+    id="search-box"
+  >
+    <input type="hidden" name="search" value="true" />
+
+    <div class="row">
+      <div class="col-md-4 col-xl-2 search-form-input">
+        <label for="search_name" class="control-label">Name: </label>
+        <input
+          type="text"
+          name="name"
+          id="search_name"
+          value={@conn.params["name"]}
+          placeholder=""
+          class="form-control"
+        />
+      </div>
+
+      <div class="col-md-4 col-xl-2 search-form-input">
+        <.input
+          type="select"
+          id="search_order"
+          name="search[order]"
+          label="Order by"
+          value={@params["order"] || "Name (A-Z)"}
+          options={[
+            "Name (A-Z)",
+            "Name (Z-A)",
+            "Newest first",
+            "Oldest first"
+          ]}
+        />
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="offset-md-8 col-md-4 offset-xl-10 col-xl-2">
+        &nbsp;<br />
+        <input type="submit" value="Search" class={"btn btn-#{bsname} btn-block"} />
+      </div>
+    </div>
+  </form>
+</div>

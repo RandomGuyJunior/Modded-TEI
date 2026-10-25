@@ -1,0 +1,1179 @@
+defmodule TeiserverWeb.Admin.UserController do
+  @moduledoc false
+
+  alias Teiserver.Account
+  alias Teiserver.Account.Auth
+  alias Teiserver.Account.AuthLib
+  alias Teiserver.Account.Role
+  alias Teiserver.Account.RoleLib
+  alias Teiserver.Account.SmurfMergeTask
+  alias Teiserver.Account.Tasks.GdprForgetTask
+  alias Teiserver.Account.TOTPLib
+  alias Teiserver.Account.User
+  alias Teiserver.Account.UserLib
+  alias Teiserver.Battle
+  alias Teiserver.Battle.BalanceLib
+  alias Teiserver.CacheUser
+  alias Teiserver.EmailHelper
+  alias Teiserver.Game
+  alias Teiserver.Game.MatchRatingLib
+  alias Teiserver.Moderation.RefreshUserRestrictionsTask
+  alias Teiserver.Player
+
+  use TeiserverWeb, :controller
+
+  require Logger
+
+  import Teiserver.Helper.NumberHelper, only: [int_parse: 1, float_parse: 1]
+
+  plug(AssignPlug,
+    site_menu_active: "teiserver_user",
+    sub_menu_active: "user"
+  )
+
+  action_fallback TeiserverWeb.Controllers.BodyguardFallback
+
+  plug(Bodyguard.Plug.Authorize,
+    policy: Auth,
+    fallback: TeiserverWeb.Controllers.BodyguardFallback,
+    action: {Phoenix.Controller, :action_name},
+    user: {AuthLib, :current_user}
+  )
+
+  plug TeiserverWeb.Plugs.PaginationParams
+
+  plug(:add_breadcrumb, name: "Admin", url: "/teiserver/admin")
+  plug(:add_breadcrumb, name: "Users", url: "/teiserver/admin/user")
+
+  @spec index(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def index(conn, params) do
+    page = params["page"]
+    limit = params["limit"]
+
+    search_term = get_search_term(params)
+
+    users =
+      Account.list_users(
+        search: [basic_search: search_term],
+        order_by: "Newest first",
+        limit: limit,
+        offset: page * limit
+      )
+
+    # Add exact matches on first page for non-empty searches
+    exact_match =
+      if should_show_exact_match?(page, users, search_term) do
+        Account.list_users(search: [name_lower: search_term])
+      else
+        []
+      end
+
+    users =
+      (exact_match ++ users) |> Enum.uniq_by(fn user -> user.id end) |> Enum.reject(&(&1 == nil))
+
+    user_stats = for user <- users, do: Account.get_user_stat_data(user.id)
+
+    total_users =
+      if search_term == "" do
+        Account.count_users()
+      else
+        Account.count_users(search: [basic_search: search_term])
+      end
+
+    total_pages = div(total_users - 1, limit) + 1
+
+    if Enum.count(users) == 1 do
+      found_id = users |> hd() |> Map.get(:id)
+      conn |> redirect(to: ~p"/teiserver/admin/user/#{found_id}")
+    else
+      conn
+      |> add_breadcrumb(name: "List users", url: conn.request_path)
+      |> assign(:users, Enum.zip(users, user_stats))
+      |> assign(:page, page)
+      |> assign(:limit, limit)
+      |> assign(:total_pages, total_pages)
+      |> assign(:total_count, total_users)
+      |> assign(:current_count, Enum.count(users))
+      |> assign(:params, Map.put(params, "limit", limit))
+      |> render("index.html")
+    end
+  end
+
+  @spec search(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def search(conn, params) do
+    page = params["page"]
+    limit = params["limit"]
+
+    id_list =
+      if params["search"]["previous_names"] != nil and params["search"]["previous_names"] != "" do
+        Account.list_user_stats(
+          search: [
+            data_contains: {"previous_names", params["search"]["previous_names"]}
+          ],
+          select: [:user_id]
+        )
+        |> Enum.map(fn s -> s.user_id end)
+      else
+        []
+      end
+
+    users =
+      (Account.list_users(
+         search: [
+           name_or_email: Map.get(params, "name", "") |> String.trim(),
+           has_role: params["search"]["role"],
+           ip: params["search"]["ip"],
+           lobby_client: params["search"]["lobby_client"],
+           previous_names: params["search"]["previous_names"],
+           mod_action: params["search"]["mod_action"]
+         ],
+         limit: limit,
+         offset: page * limit,
+         order_by: params["order"] || "Name (A-Z)"
+       ) ++
+         Account.list_users(search: [id_in: id_list]))
+      |> Enum.uniq()
+
+    user_stats = for user <- users, do: Account.get_user_stat_data(user.id)
+
+    total_users =
+      Account.count_users(
+        search: [
+          name_or_email: Map.get(params, "name", "") |> String.trim(),
+          has_role: params["search"]["role"],
+          ip: params["search"]["ip"],
+          lobby_client: params["search"]["lobby_client"],
+          previous_names: params["search"]["previous_names"],
+          mod_action: params["search"]["mod_action"]
+        ]
+      )
+
+    total_pages = div(total_users - 1, limit) + 1
+
+    conn
+    |> add_breadcrumb(name: "User search", url: conn.request_path)
+    |> assign(:page, page)
+    |> assign(:limit, limit)
+    |> assign(:total_pages, total_pages)
+    |> assign(:total_count, total_users)
+    |> assign(:current_count, Enum.count(users))
+    |> assign(:params, params)
+    |> assign(:users, Enum.zip(users, user_stats))
+    |> render("index.html")
+  end
+
+  @spec data_search(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def data_search(conn, params) do
+    users =
+      if params["data_search"] == nil do
+        []
+      else
+        UserLib.list_users_by_data(params["data_search"])
+      end
+
+    user_stats = for user <- users, do: Account.get_user_stat_data(user.id)
+
+    conn
+    |> add_breadcrumb(name: "Data search", url: conn.request_path)
+    |> assign(:params, params["data_search"])
+    |> assign(:data_search, true)
+    |> assign(:users, Enum.zip(users, user_stats))
+    |> render("index.html")
+  end
+
+  @spec show(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def show(conn, %{"id" => id}) do
+    user = Account.get_user(id)
+
+    case UserLib.has_access(user, conn) do
+      {true, _role} ->
+        user
+        |> UserLib.make_favourite()
+        |> insert_recently(conn)
+
+        user_stats = Account.get_user_stat_data(user.id)
+        client = Account.get_client_by_id(user.id)
+
+        client_totp = TOTPLib.get_user_totp_status(user.id)
+
+        json_user =
+          Map.drop(user, [
+            :__struct__,
+            :__meta__,
+            :user_configs,
+            :smurf_of,
+            :user_stat,
+            :data
+          ])
+
+        cache_user = Account.deprecated_get_user_by_id(user.id)
+
+        extra_cache_keys =
+          cache_user
+          |> Map.keys()
+          |> Enum.reject(fn cache_user_key ->
+            json_user |> Map.keys() |> Enum.member?(cache_user_key)
+          end)
+
+        conn
+        |> assign(:user, user)
+        |> assign(:client, client)
+        |> assign(:client_totp, client_totp)
+        |> assign(:user_stats, user_stats)
+        |> assign(:role_data, RoleLib.role_data())
+        |> assign(:section_menu_active, "show")
+        |> assign(:json_user, json_user)
+        |> assign(:cache_user, cache_user)
+        |> assign(:extra_cache_keys, extra_cache_keys)
+        |> assign(:has_active_mfa?, has_active_mfa?(user.id))
+        |> add_breadcrumb(name: "Show: #{user.name}", url: conn.request_path)
+        |> render("show.html")
+
+      {false, :restricted_user} ->
+        conn
+        |> put_flash(:danger, "This is a restricted user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access this user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec edit(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def edit(conn, %{"id" => id}) do
+    current_user = conn.assigns.current_user
+    user = Account.get_user(id)
+
+    changeable_roles =
+      cond do
+        Enum.member?(current_user.roles, "Server") ->
+          RoleLib.allowed_role_management("Server")
+
+        Enum.member?(current_user.roles, "Admin") ->
+          RoleLib.allowed_role_management("Admin")
+
+        Enum.member?(current_user.roles, "Senior moderator") ->
+          RoleLib.allowed_role_management("Senior moderator")
+
+        Enum.member?(current_user.roles, "Moderator") ->
+          RoleLib.allowed_role_management("Moderator")
+
+        true ->
+          []
+      end
+
+    case UserLib.has_access(user, conn) do
+      {true, _role} ->
+        changeset = Account.change_user(user)
+
+        conn
+        |> assign(:user, user)
+        |> assign(:changeset, changeset)
+        |> assign(:management_roles, RoleLib.management_roles())
+        |> assign(:moderation_roles, RoleLib.moderation_roles())
+        |> assign(:staff_roles, RoleLib.staff_roles())
+        |> assign(:community_roles, RoleLib.community_roles())
+        |> assign(:privileged_roles, RoleLib.privileged_roles())
+        |> assign(:property_roles, RoleLib.property_roles())
+        |> assign(:role_data, RoleLib.role_data())
+        |> assign(:has_active_mfa?, has_active_mfa?(user.id))
+        |> assign(:changeable_roles, changeable_roles)
+        |> add_breadcrumb(name: "Edit: #{user.name}", url: conn.request_path)
+        |> render("edit.html")
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access this user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec update(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def update(conn, %{"id" => id, "user" => user_params}) do
+    current_user = conn.assigns.current_user
+    user = Account.get_user!(id)
+
+    # We decache now and later to ensure we decache data as it stands too
+    Account.decache_user(user.id)
+
+    changeable_roles =
+      cond do
+        Enum.member?(current_user.roles, "Server") ->
+          RoleLib.allowed_role_management("Server")
+
+        Enum.member?(current_user.roles, "Admin") ->
+          RoleLib.allowed_role_management("Admin")
+
+        Enum.member?(current_user.roles, "Senior moderator") ->
+          RoleLib.allowed_role_management("Senior moderator")
+
+        Enum.member?(current_user.roles, "Moderator") ->
+          RoleLib.allowed_role_management("Moderator")
+
+        true ->
+          []
+      end
+
+    # Go through all roles, any we're not allowed to change
+    # we leave as they are, any we are we do stuff with
+    new_roles =
+      RoleLib.all_role_names()
+      |> Enum.map(fn role_name ->
+        selected =
+          if Enum.member?(changeable_roles, role_name) do
+            user_params[role_name] == "true"
+          else
+            Enum.member?(user.roles, role_name)
+          end
+
+        if selected do
+          role_name
+        end
+      end)
+      |> Enum.reject(&(&1 == nil))
+      |> Enum.uniq()
+
+    roles_changed = MapSet.new(new_roles) != MapSet.new(user.roles)
+
+    permissions =
+      new_roles
+      |> Enum.map(fn role_name ->
+        %Role{} = role_def = RoleLib.role_data(role_name)
+        [role_name | role_def.contains]
+      end)
+      |> List.flatten()
+      |> Enum.uniq()
+
+    data =
+      Map.merge(user.data || %{}, %{
+        "bot" => Enum.member?(permissions, "Bot"),
+        "moderator" => Enum.member?(permissions, "Moderator"),
+        "roles" => new_roles
+      })
+
+    user_params =
+      Map.merge(user_params, %{
+        "data" => data,
+        "permissions" => permissions,
+        "roles" => new_roles
+      })
+
+    case UserLib.has_access(user, conn) do
+      {true, _role} ->
+        change_result =
+          cond do
+            allow?(conn, "Server") ->
+              Account.server_update_user(user, user_params)
+
+            allow?(conn, "Admin") ->
+              Account.admin_update_user(user, user_params)
+
+            allow?(conn, "Senior moderator") ->
+              Account.senior_moderator_update_user(user, user_params)
+
+            allow?(conn, "Moderator") ->
+              Account.moderator_update_user(user, user_params)
+          end
+
+        case change_result do
+          {:ok, user} ->
+            Account.decache_user(user.id)
+
+            if roles_changed do
+              Player.update_user_roles(user.id, user.roles)
+            end
+
+            conn
+            |> put_flash(:info, "User updated successfully.")
+            # |> redirect(to: ~p"/teiserver/admin/user")
+            |> redirect(to: ~p"/teiserver/admin/user/#{user.id}")
+
+          {:error, %Ecto.Changeset{} = changeset} ->
+            conn
+            |> assign(:management_roles, RoleLib.management_roles())
+            |> assign(:moderation_roles, RoleLib.moderation_roles())
+            |> assign(:staff_roles, RoleLib.staff_roles())
+            |> assign(:community_roles, RoleLib.community_roles())
+            |> assign(:privileged_roles, RoleLib.privileged_roles())
+            |> assign(:property_roles, RoleLib.property_roles())
+            |> assign(:role_data, RoleLib.role_data())
+            |> assign(:has_active_mfa?, has_active_mfa?(user.id))
+            |> assign(:changeable_roles, changeable_roles)
+            |> render("edit.html", user: user, changeset: changeset)
+        end
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access this user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec reset_password(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def reset_password(conn, %{"id" => id}) do
+    user = Account.get_user!(id)
+
+    case UserLib.has_access(user, conn) do
+      {false, :not_found} ->
+        conn
+        |> put_flash(:danger, "Unable to find that user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+
+      {false, :no_access} ->
+        conn
+        |> put_flash(:danger, "Unable to find that user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+
+      {true, _role} ->
+        case EmailHelper.send_password_reset(user) do
+          :ok ->
+            conn
+            |> put_flash(:success, "Password reset email sent to user")
+            |> redirect(to: ~p"/teiserver/admin/user/#{user}")
+
+          {:error, error} ->
+            Logger.error(
+              "Failed to send password reset email to user at #{user.email}: #{inspect(error)}"
+            )
+
+            conn
+            |> put_flash(:error, "Oops, something went wrong resetting the password")
+            |> redirect(to: ~p"/teiserver/admin/user/#{user}")
+        end
+    end
+  end
+
+  @spec disable_totp(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def disable_totp(conn, %{"id" => id}) do
+    user = Account.get_user(id)
+    TOTPLib.disable_totp(user.id)
+
+    conn
+    |> put_flash(:info, "Disabled MFA for #{user.name}")
+    |> redirect(to: ~p"/teiserver/admin/user/#{user}")
+  end
+
+  @spec ratings(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def ratings(conn, %{"id" => id} = params) do
+    user = Account.get_user(id)
+
+    case UserLib.has_access(user, conn) do
+      {true, _role} ->
+        filter = params["filter"]
+        filter_type_id = MatchRatingLib.rating_type_name_lookup()[filter]
+        season = MatchRatingLib.active_season()
+
+        page = params["page"]
+
+        limit = params["limit"]
+
+        ratings =
+          Account.list_ratings(
+            search: [
+              user_id: user.id,
+              season: season
+            ],
+            preload: [:rating_type]
+          )
+          |> Map.new(fn rating ->
+            {rating.rating_type.name, rating}
+          end)
+
+        total_count =
+          Game.count_rating_logs(
+            search: [
+              user_id: user.id,
+              rating_type_id: filter_type_id,
+              season: season
+            ]
+          )
+
+        logs =
+          Game.list_rating_logs(
+            search: [
+              user_id: user.id,
+              rating_type_id: filter_type_id,
+              season: season
+            ],
+            order_by: "Newest first",
+            limit: limit,
+            offset: page * limit,
+            preload: [:match, :match_membership]
+          )
+
+        games = Enum.count(logs) |> max(1)
+        wins = Enum.count(logs, fn l -> l.match_membership.win end)
+
+        stats =
+          if Enum.empty?(logs) do
+            %{first_log: nil}
+          else
+            %{
+              games: games,
+              winrate: wins / games,
+              first_log: logs |> Enum.reverse() |> hd()
+            }
+          end
+
+        total_pages = div(total_count - 1, limit) + 1
+
+        conn
+        |> assign(:filter, filter || "rating-all")
+        |> assign(:user, user)
+        |> assign(:ratings, ratings)
+        |> assign(:logs, logs)
+        |> assign(:rating_type_list, MatchRatingLib.rating_type_list())
+        |> assign(:rating_type_id_lookup, MatchRatingLib.rating_type_id_lookup())
+        |> assign(:stats, stats)
+        |> add_breadcrumb(name: "Ratings: #{user.name}", url: conn.request_path)
+        |> assign(:page, page)
+        |> assign(:limit, limit)
+        |> assign(:total_pages, total_pages)
+        |> assign(:total_count, total_count)
+        |> assign(:current_count, Enum.count(logs))
+        |> render("ratings.html")
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access this user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec ratings_form(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def ratings_form(conn, %{"id" => id}) do
+    user = Account.get_user(id)
+
+    case UserLib.has_access(user, conn) do
+      {true, _role} ->
+        ratings =
+          Account.list_ratings(
+            search: [
+              user_id: user.id,
+              season: MatchRatingLib.active_season()
+            ],
+            preload: [:rating_type]
+          )
+          |> Map.new(fn rating ->
+            {rating.rating_type.name, rating}
+          end)
+
+        conn
+        |> assign(:user, user)
+        |> assign(:ratings, ratings)
+        |> assign(:default_rating, BalanceLib.default_rating())
+        |> assign(:rating_type_list, MatchRatingLib.rating_type_list())
+        |> add_breadcrumb(name: "Ratings form: #{user.name}", url: conn.request_path)
+        |> render("ratings_form.html")
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access this user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec ratings_post(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def ratings_post(conn, %{"id" => id} = params) do
+    user = Account.get_user(id)
+
+    case UserLib.has_access(user, conn) do
+      {true, _role} ->
+        changes =
+          MatchRatingLib.rating_type_list()
+          |> Enum.map(fn r -> {r, params[r]} end)
+          |> Enum.reject(fn {_r, changes} ->
+            changes["skill"] == changes["old_skill"] and
+              changes["uncertainty"] == changes["old_uncertainty"]
+          end)
+          |> Enum.map(fn {rating_type, changes} ->
+            rating_type_id = MatchRatingLib.rating_type_name_lookup()[rating_type]
+
+            existing_rating = Account.get_rating(user.id, rating_type_id)
+            user_rating = existing_rating || BalanceLib.default_rating()
+            new_skill = changes["skill"] |> float_parse()
+            new_uncertainty = changes["uncertainty"] |> float_parse()
+            new_rating_value = BalanceLib.calculate_rating_value(new_skill, new_uncertainty)
+
+            new_leaderboard_rating =
+              BalanceLib.calculate_leaderboard_rating(new_skill, new_uncertainty)
+
+            {:ok, new_rating} =
+              case Account.get_rating(user.id, rating_type_id) do
+                nil ->
+                  Account.create_rating(%{
+                    user_id: user.id,
+                    rating_type_id: rating_type_id,
+                    rating_value: new_rating_value,
+                    skill: new_skill,
+                    uncertainty: new_uncertainty,
+                    leaderboard_rating: new_leaderboard_rating,
+                    last_updated: DateTime.utc_now(),
+                    season: MatchRatingLib.active_season()
+                  })
+
+                existing ->
+                  Account.update_rating(existing, %{
+                    rating_value: new_rating_value,
+                    skill: new_skill,
+                    uncertainty: new_uncertainty,
+                    leaderboard_rating: new_leaderboard_rating,
+                    last_updated: DateTime.utc_now(),
+                    season: MatchRatingLib.active_season()
+                  })
+              end
+
+            log_params = %{
+              user_id: user.id,
+              rating_type_id: rating_type_id,
+              match_id: nil,
+              inserted_at: DateTime.utc_now(),
+              season: MatchRatingLib.active_season(),
+              value: %{
+                reason: "Manual adjustment",
+                rating_value: new_rating_value,
+                skill: new_skill,
+                uncertainty: new_uncertainty,
+                rating_value_change: new_rating_value - user_rating.rating_value,
+                skill_change: new_skill - user_rating.skill,
+                uncertainty_change: new_uncertainty - user_rating.uncertainty
+              }
+            }
+
+            {:ok, log} = Game.create_rating_log(log_params)
+
+            {new_rating, log}
+          end)
+
+        log_ids =
+          changes
+          |> Enum.map(fn {_type, log} -> log.id end)
+
+        add_audit_log(conn, "Teiserver:Changed user rating", %{
+          user_id: user.id,
+          log_ids: log_ids
+        })
+
+        conn
+        |> put_flash(:success, "Ratings updated")
+        |> redirect(to: ~p"/teiserver/admin/users/ratings_form/#{user.id}")
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access this user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec perform_action(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def perform_action(conn, %{"id" => id, "action" => action}) do
+    user = Account.get_user!(id)
+
+    case UserLib.has_access(user, conn) do
+      {true, _role} ->
+        result =
+          case action do
+            "recache" ->
+              RefreshUserRestrictionsTask.refresh_user(user.id)
+              CacheUser.deprecated_recache_user(user.id)
+              {:ok, ""}
+
+            "reset_flood_protection" ->
+              ConCache.put(:teiserver_login_count, user.id, 0)
+              {:ok, ""}
+          end
+
+        case result do
+          {:ok, tab} ->
+            conn
+            |> put_flash(:info, "Action performed.")
+            |> redirect(to: ~p"/teiserver/admin/users/applying/#{user.id}?tab=#{tab}")
+        end
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access this user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec smurf_search(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def smurf_search(conn, %{"id" => id}) do
+    user = Account.get_user!(id)
+
+    case UserLib.has_access(user, conn) do
+      {true, _role} ->
+        all_user_keys =
+          Account.list_smurf_keys(
+            search: [
+              user_id: user.id
+            ],
+            limit: :infinity,
+            preload: [:type],
+            order_by: "Newest first"
+          )
+
+        key_count_by_type_name =
+          all_user_keys
+          |> Enum.group_by(fn k -> k.type.name end, fn _key -> 1 end)
+          |> Enum.map(fn {k, vs} -> {k, Enum.count(vs)} end)
+          |> Enum.sort(&<=/2)
+
+        user_key_lookup =
+          all_user_keys
+          |> Map.new(fn k -> {k.value, k} end)
+
+        matching_keys = Account.smurf_search(user)
+
+        key_types =
+          matching_keys
+          |> Enum.map(fn {{type, _value}, _matches} -> type end)
+          |> Enum.uniq()
+          |> Enum.sort()
+
+        users =
+          matching_keys
+          |> Enum.map(fn {{_type, _value}, matches} ->
+            matches
+            |> Enum.map(fn m -> m.user end)
+          end)
+          |> List.flatten()
+          |> Map.new(fn user -> {user.id, user} end)
+          |> Enum.map(fn {_id, user} -> user end)
+          |> Enum.sort_by(
+            fn user ->
+              user.last_login
+            end,
+            &>=/2
+          )
+
+        # Next we want to know the date of the key we matched against for that user
+        key_lookup =
+          matching_keys
+          |> Enum.map(fn {{matched_type, _matched_value}, matches} ->
+            matches
+            |> Enum.map(fn match ->
+              {{matched_type, match.user_id}, match}
+            end)
+          end)
+          |> List.flatten()
+          |> Enum.sort_by(fn {_k, v} -> v.last_updated end, &<=/2)
+          |> Map.new()
+
+        stats_map =
+          users
+          |> Map.new(fn %{id: id} ->
+            {id, Account.get_user_stat_data(id)}
+          end)
+
+        stats = Account.get_user_stat_data(user.id)
+
+        games_allied =
+          users
+          |> Map.new(fn %{id: id} ->
+            {id,
+             Battle.list_matches(
+               search: [ally_opponent: {user.id, id, nil}],
+               limit: :infinity
+             )
+             |> length()}
+          end)
+
+        games_vs =
+          users
+          |> Map.new(fn %{id: id} ->
+            {id,
+             Battle.list_matches(
+               search: [ally_opponent: {user.id, nil, id}],
+               limit: :infinity
+             )
+             |> length()}
+          end)
+
+        conn
+        |> add_breadcrumb(name: "List of possible smurf accounts", url: conn.request_path)
+        |> assign(:all_user_keys, all_user_keys)
+        |> assign(:key_count_by_type_name, key_count_by_type_name)
+        |> assign(:user, user)
+        |> assign(:stats, stats)
+        |> assign(:params, search_defaults(conn))
+        |> assign(:key_types, key_types)
+        |> assign(:users, users)
+        |> assign(:key_lookup, key_lookup)
+        |> assign(:user_key_lookup, user_key_lookup)
+        |> assign(:stats_map, stats_map)
+        |> assign(:games_allied, games_allied)
+        |> assign(:games_vs, games_vs)
+        |> render("smurf_list.html")
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access this user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec create_smurf_key(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def create_smurf_key(conn, %{"userid" => userid, "key" => key, "value" => value}) do
+    case Account.create_smurf_key(userid, key, value) do
+      {:ok, _smurf_key} ->
+        conn
+        |> put_flash(:info, "Key added successfully.")
+        |> redirect(to: ~p"/teiserver/admin/users/smurf_search/#{userid}")
+
+      {:error, %Ecto.Changeset{} = _changeset} ->
+        conn
+        |> put_flash(:info, "Unable to add that key")
+        |> redirect(to: ~p"/teiserver/admin/users/smurf_search/#{userid}")
+    end
+  end
+
+  @spec delete_smurf_key(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def delete_smurf_key(conn, %{"id" => id}) do
+    key = Account.get_smurf_key(id)
+
+    if key do
+      Account.delete_smurf_key(key)
+
+      conn
+      |> put_flash(:success, "Key deleted")
+      |> redirect(to: ~p"/teiserver/admin/users/smurf_search/#{key.user_id}")
+    else
+      conn
+      |> put_flash(:info, "Unable to find that key")
+      |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec mark_as_smurf_of(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def mark_as_smurf_of(conn, %{"smurf_id" => smurf_id, "origin_id" => origin_id}) do
+    smurf_user = Account.get_user!(smurf_id)
+    origin_user = Account.get_user!(origin_id)
+
+    result =
+      UserLib.mark_user_as_smurf_of(conn.assigns.current_user, %{
+        smurf: smurf_user,
+        origin: origin_user
+      })
+
+    case result do
+      :ok ->
+        conn
+        |> put_flash(:success, "Applied the changes")
+        |> redirect(to: ~p"/teiserver/admin/user/#{smurf_user.id}")
+
+      {:error, reason} ->
+        conn
+        |> put_flash(:danger, "Marking failed: #{reason}")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec cancel_smurf_mark(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def cancel_smurf_mark(conn, %{"user_id" => id}) do
+    user = Account.get_user!(id)
+    origin_user_id = user.smurf_of_id
+
+    case UserLib.has_access(user, conn) do
+      {true, _role} ->
+        case Account.update_user_smurf(user, %{smurf_of_id: nil}) do
+          {:ok, user} ->
+            add_audit_log(conn, "Moderation:Cancel smurf mark", %{
+              smurf_userid: user.id,
+              origin_id: user.smurf_of_id
+            })
+
+            # Now we update stats for the origin
+            smurf_count =
+              Account.list_users(
+                search: [
+                  smurf_of: origin_user_id
+                ],
+                select: [:id]
+              )
+              |> Enum.count()
+
+            # And give the origin the smurfer role
+            if smurf_count == 0 do
+              Auth.remove_roles(origin_user_id, ["Smurfer"])
+            end
+
+            Account.update_user_stat(origin_user_id, %{"smurf_count" => smurf_count})
+
+            conn
+            |> put_flash(:info, "Smurf link broken.")
+            |> redirect(to: ~p"/teiserver/admin/user/#{user.id}")
+
+          {:error, %Ecto.Changeset{} = changeset} ->
+            render(conn, "edit.html", user: user, changeset: changeset)
+        end
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access this user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec smurf_merge_form(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def smurf_merge_form(conn, %{"from_id" => from_id, "to_id" => to_id}) do
+    from_user = Account.get_user!(from_id)
+    to_user = Account.get_user!(to_id)
+
+    access = {
+      UserLib.has_access(from_user, conn),
+      UserLib.has_access(to_user, conn)
+    }
+
+    case access do
+      {{true, _role1}, {true, _role2}} ->
+        conn
+        |> add_breadcrumb(name: "Smurf merge form", url: conn.request_path)
+        |> assign(:from_user, from_user)
+        |> assign(:to_user, to_user)
+        |> render("smurf_merge_form.html")
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access at least one of these users")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec smurf_merge_post(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def smurf_merge_post(conn, %{"from_id" => from_id, "to_id" => to_id, "merge" => merge}) do
+    from_user = Account.get_user!(from_id)
+    to_user = Account.get_user!(to_id)
+
+    access = {
+      UserLib.has_access(from_user, conn),
+      UserLib.has_access(to_user, conn)
+    }
+
+    case access do
+      {{true, _role1}, {true, _role2}} ->
+        SmurfMergeTask.perform(from_user.id, to_user.id, merge)
+
+        fields =
+          merge
+          |> Enum.filter(fn {_k, v} -> v == "true" end)
+          |> Enum.map(fn {k, _v} -> k end)
+
+        add_audit_log(conn, "Teiserver:Smurf merge", %{
+          fields: fields,
+          from_id: from_user.id,
+          to_id: to_user.id
+        })
+
+        conn
+        |> put_flash(:success, "Applied the changes")
+        |> redirect(to: ~p"/teiserver/admin/user/#{to_user.id}")
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access at least one of these users")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec relationships(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def relationships(conn, %{"id" => id}) do
+    user = Account.get_user!(id)
+    id = user.id
+
+    relationships = %{
+      friends: Account.list_friend_ids_of_user(id),
+      friend_requests: Account.list_incoming_friend_requests_of_userid(id),
+      followed: Account.list_userids_followed_by_userid(id),
+      ignored: Account.list_userids_ignored_by_userid(id),
+      avoided: Account.list_userids_avoided_by_userid(id),
+      avoiding: Account.list_userids_avoiding_this_userid(id),
+      blocked: Account.list_userids_blocked_by_userid(id),
+      blocking: Account.list_userids_blocking_this_userid(id)
+    }
+
+    user_ids =
+      relationships
+      |> Map.values()
+      |> List.flatten()
+      |> Enum.uniq()
+
+    lookup =
+      Account.list_users(search: [id_in: user_ids], limit: :infinity)
+      |> Map.new(fn u -> {u.id, u} end)
+
+    conn
+    |> assign(:user, user)
+    |> assign(:lookup, lookup)
+    |> assign(:relationships, relationships)
+    |> add_breadcrumb(name: "Show: #{user.name}", url: ~p"/teiserver/admin/user/#{id}")
+    |> add_breadcrumb(name: "Relationships", url: conn.request_path)
+    |> render("relationships.html")
+  end
+
+  @spec set_stat(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def set_stat(conn, %{"userid" => userid, "key" => key, "value" => value}) do
+    user = Account.get_user!(userid)
+
+    if value == "" do
+      userid |> int_parse() |> Account.delete_user_stat_keys([key])
+    else
+      Account.update_user_stat(user.id, %{key => value})
+    end
+
+    RefreshUserRestrictionsTask.refresh_user(user.id)
+    CacheUser.deprecated_recache_user(user.id)
+
+    # Now we update stats for the origin
+    smurf_count =
+      Account.list_users(
+        search: [
+          smurf_of: user.id
+        ],
+        select: [:id]
+      )
+      |> Enum.count()
+
+    Account.update_user_stat(user.id, %{"smurf_count" => smurf_count})
+
+    conn
+    |> put_flash(:success, "stat #{key} updated")
+    |> redirect(to: ~p"/teiserver/admin/user/#{user.id}" <> "#details_tab")
+  end
+
+  @spec rename_form(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def rename_form(conn, %{"id" => id}) do
+    user = Account.get_user(id)
+
+    case UserLib.has_access(user, conn) do
+      {true, _role} ->
+        conn
+        |> assign(:user, user)
+        |> add_breadcrumb(name: "Rename: #{user.name}", url: conn.request_path)
+        |> render("rename_form.html")
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access this user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec rename_post(Plug.Conn.t(), map) :: Plug.Conn.t()
+  def rename_post(conn, %{"id" => id, "new_name" => new_name}) do
+    user = Account.get_user(id)
+
+    case UserLib.has_access(user, conn) do
+      {true, _role} ->
+        admin_action = AuthLib.allow?(conn, "Senior moderator")
+
+        case CacheUser.rename_user(user.id, new_name, admin_action) do
+          :success ->
+            add_audit_log(conn, "Teiserver:Changed user name", %{
+              user_id: user.id,
+              from: user.name,
+              to: new_name
+            })
+
+            conn
+            |> put_flash(:success, "User renamed")
+            |> redirect(to: ~p"/teiserver/admin/user/#{user.id}")
+
+          {:error, reason} ->
+            conn
+            |> assign(:user, user)
+            |> put_flash(:danger, "Error with rename: #{reason}")
+            |> add_breadcrumb(name: "Rename: #{user.name}", url: conn.request_path)
+            |> render("rename_form.html")
+        end
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to access this user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec applying(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def applying(conn, %{"id" => id} = params) do
+    # Gives stuff time to happen
+    :timer.sleep(500)
+
+    tab =
+      if params["tab"] do
+        "##{params["tab"]}"
+      else
+        ""
+      end
+
+    conn
+    |> redirect(to: ~p"/teiserver/admin/user/#{id}" <> tab)
+  end
+
+  @spec search_defaults(Plug.Conn.t()) :: map()
+  defp search_defaults(_conn) do
+    %{
+      "limit" => "50"
+    }
+  end
+
+  defp get_search_term(params, key \\ "s") do
+    Map.get(params, key, "") |> String.trim()
+  end
+
+  defp should_show_exact_match?(page, users, search_term) do
+    page == 0 && Enum.count(users) > 20 && search_term != ""
+  end
+
+  @doc """
+  Removes all PII from a user in accordance with GDPR.
+  """
+  @spec gdpr_forget(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def gdpr_forget(conn, %{"id" => id}) do
+    user = Account.get_user(id)
+
+    case GdprForgetTask.forget_user(conn, user) do
+      :ok ->
+        conn
+        |> put_flash(:success, "User GDPR forgotten")
+        |> redirect(to: ~p"/teiserver/admin/user/#{user.id}")
+
+      {:error, reason} ->
+        conn
+        |> put_flash(:danger, "Error: #{reason}")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+
+  @spec shadowban(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def shadowban(conn, %{"id" => id, "state" => state}) do
+    %User{} = user = Account.get_user_by_id(id)
+
+    case UserLib.has_access(user, conn) do
+      {true, _access} ->
+        message =
+          case state do
+            "true" ->
+              add_audit_log(conn, "Shadowban", %{target_id: user.id})
+              CacheUser.shadowban_user(user.id)
+              "has been shadowbanned"
+
+            "false" ->
+              add_audit_log(conn, "Unshadowban", %{target_id: user.id})
+              CacheUser.unshadowban_user(user.id)
+              "has been cleared of shadowban"
+          end
+
+        conn
+        |> put_flash(:success, "User #{user.name} #{message}")
+        |> redirect(to: ~p"/teiserver/admin/user/#{user.id}")
+
+      _no_access ->
+        conn
+        |> put_flash(:danger, "Unable to shadowban this user")
+        |> redirect(to: ~p"/teiserver/admin/user")
+    end
+  end
+end

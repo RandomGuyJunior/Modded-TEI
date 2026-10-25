@@ -1,0 +1,44 @@
+<% bsname = view_colour() %>
+
+<script type="text/javascript" charset="utf-8">
+  $(function() {
+    $('.datepicker').datepicker({
+      format: "dd/mm/yyyy"
+    });
+
+    $("#teiserver-user-search").val('<%= @params["teiserver_user"] %>');
+  });
+</script>
+
+{render(
+  TeiserverWeb.Logging.GeneralView,
+  "sub_menu.html",
+  Map.merge(assigns, %{active: "page_view"})
+)}
+
+<div class="row mt-3">
+  <div class="col-md-12">
+    <div class="card card-<= bsname >">
+      <div class="card-body">
+        <TeiserverWeb.Components.Logging.PageViewLogComponents.section_menu
+          active="table"
+          colour={bsname}
+        />
+      </div>
+    </div>
+  </div>
+</div>
+
+{render(Teiserver.Logging.PageViewLogView, "search_report.html",
+  conn: @conn,
+  params: @params,
+  permissions: @current_user.permissions
+)}
+
+<div class="row">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname} page-card"}>
+      <div class="card-body"></div>
+    </div>
+  </div>
+</div>

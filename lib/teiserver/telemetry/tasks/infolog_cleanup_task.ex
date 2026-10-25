@@ -1,0 +1,25 @@
+defmodule Teiserver.Telemetry.InfologCleanupTask do
+  @moduledoc false
+
+  alias Ecto.Adapters.SQL
+  alias Teiserver.Repo
+
+  use Oban.Worker, queue: :cleanup
+
+  @impl Oban.Worker
+  @spec perform(any) :: :ok
+  def perform(_job) do
+    days = Application.get_env(:teiserver, Teiserver)[:retention][:telemetry_infolog]
+
+    before_timestamp = DateTime.shift(DateTime.utc_now(), day: -days)
+
+    query = """
+          DELETE FROM telemetry_infologs
+          WHERE timestamp < $1
+    """
+
+    SQL.query!(Repo, query, [before_timestamp])
+
+    :ok
+  end
+end

@@ -1,0 +1,145 @@
+<% bsname = view_colour() %>
+
+<script type="text/javascript" charset="utf-8">
+  $(function() {
+    var selected_tab = window.location.hash.substr(1).replace("_tab", "");
+    $('#the_tabs a:first').tab('show');
+    $('#the_tabs [href="#' + selected_tab + '_tab"]').tab('show');
+  });
+</script>
+
+<TeiserverWeb.Moderation.ModerationComponents.sub_menu
+  active="reports"
+  view_colour={view_colour()}
+/>
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <TeiserverWeb.Components.Moderation.ReportComponents.section_menu
+          active="show"
+          view_colour={view_colour()}
+          current_user={@current_user}
+        />
+        <hr />
+
+        <div class="float-end">
+          <%= if allow?(@conn, "Moderator") do %>
+            <%= if @report.closed do %>
+              {link(raw("<i class='fa-solid fa-fw fa-folder-open'></i> Open"),
+                to: ~p"/moderation/report/#{@report.id}/open",
+                method: "put",
+                class: "btn btn-outline-#{bsname}"
+              )}
+            <% else %>
+              <%= if @report.result_id == nil do %>
+                {link(raw("<i class='fa-solid fa-fw fa-folder-closed'></i> Close"),
+                  to: ~p"/moderation/report/#{@report.id}/close",
+                  method: "put",
+                  class: "btn btn-outline-#{bsname}"
+                )}
+              <% end %>
+            <% end %>
+          <% end %>
+
+          <a
+            class="btn btn-outline-warning"
+            href={~p"/moderation/report?target_id=#{@report.target_id}"}
+          >
+            <Fontawesome.icon icon="fa-solid fa-share-from-square" style="regular" /> &nbsp;
+            Filter by target
+          </a>
+
+          <a
+            class="btn btn-outline-warning"
+            href={~p"/moderation/report?reporter_id=#{@report.reporter_id}"}
+          >
+            <Fontawesome.icon icon="fa-solid fa-bullseye" style="regular" /> &nbsp;
+            Filter by reporter
+          </a>
+
+          <a
+            class={"btn btn-outline-#{Teiserver.Account.UserLib.colour()}"}
+            href={~p"/moderation/report/user/#{@report.target_id}"}
+          >
+            <Fontawesome.icon icon={Teiserver.Account.UserLib.icon()} style="solid" /> &nbsp;
+            User mod profile
+          </a>
+
+          <%= if allow?(@conn, "Moderator") do %>
+            <a
+              class={"btn btn-outline-#{Teiserver.Account.UserLib.colour()}"}
+              href={~p"/admin/chat?userid=#{@report.target_id}"}
+            >
+              <Fontawesome.icon icon={Teiserver.Chat.LobbyMessageLib.icon()} style="solid" />
+              &nbsp;
+              User chat
+            </a>
+
+            <a
+              class={"btn btn-outline-#{Teiserver.Account.UserLib.colour()}"}
+              href={~p"/teiserver/admin/user/#{@report.target_id}"}
+            >
+              <Fontawesome.icon icon={Teiserver.Account.UserLib.icon()} style="solid" /> &nbsp;
+              User admin
+            </a>
+
+            <%= if not @report.closed do %>
+              <a
+                class={"btn btn-outline-#{Teiserver.Moderation.ActionLib.colour()}"}
+                href={~p"/moderation/action/new_with_user?teiserver_user=#{@report.target_id}"}
+              >
+                <Fontawesome.icon icon={Teiserver.Moderation.ActionLib.icon()} style="solid" />
+                &nbsp;
+                Action user
+              </a>
+            <% end %>
+          <% end %>
+        </div>
+
+        <h3>
+          {@report.reporter.name} reported {@report.target.name}
+
+          <%= if @report.result_id do %>
+            &nbsp;
+            <Fontawesome.icon
+              icon={Teiserver.Moderation.ActionLib.icon()}
+              style="solid"
+              class="text-danger"
+            />
+          <% end %>
+
+          <%= if @report.closed do %>
+            - Closed
+          <% end %>
+        </h3>
+        <br />
+        <ul class="nav nav-tabs" role="tablist" id="the_tabs">
+          <li>
+            <a href="#details_tab" role="tab" class="nav-link" data-bs-toggle="tab">
+              <Fontawesome.icon icon="fas fa-file-alt" style="regular" /> Details
+            </a>
+          </li>
+
+          <li class="nav-item" role="presentation">
+            <a href="#actions_tab" role="tab" class="nav-link" data-bs-toggle="tab">
+              <Fontawesome.icon icon={Teiserver.Moderation.ActionLib.icon()} style="solid" />
+              Actions ({Enum.count(@actions)})
+            </a>
+          </li>
+        </ul>
+
+        <div class="tab-content">
+          <div class="tab-pane" id="details_tab" style="padding:5px;">
+            {render("tab_details.html", assigns)}
+          </div>
+
+          <div class="tab-pane" id="actions_tab" style="padding:5px;">
+            {render("tab_actions.html", assigns)}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

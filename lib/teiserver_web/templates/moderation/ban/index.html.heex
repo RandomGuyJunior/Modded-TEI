@@ -1,0 +1,81 @@
+<% bsname = view_colour() %>
+
+<TeiserverWeb.Moderation.ModerationComponents.sub_menu active="bans" view_colour={view_colour()} />
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <TeiserverWeb.Components.Moderation.BanComponents.section_menu
+          active="index"
+          colour={bsname}
+        />
+        <br /><br />
+
+        <%= if @conn.params["search"] != nil do %>
+          {render(TeiserverWeb.Moderation.BanView, "search.html", assigns)}
+        <% end %>
+
+        <h4>Listing Bans</h4>
+
+        <div class="table-responsive">
+          <table class="table table-sm">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Enabled</th>
+                <th>Reason</th>
+                <th>Values</th>
+                <th>Added by</th>
+                <th colspan="1">&nbsp;</th>
+              </tr>
+            </thead>
+            <tbody>
+              <%= for ban <- @bans do %>
+                <tr>
+                  <td>{ban.source.name}</td>
+                  <td>
+                    <%= if ban.enabled do %>
+                      <i class="fa-fw fa-solid fa-check"></i>
+                    <% end %>
+                  </td>
+
+                  <td>{ban.reason}</td>
+                  <td>{Enum.count(ban.key_values)}</td>
+
+                  <td>{ban.added_by.name}</td>
+
+                  <td>
+                    <%= if allow?(@conn, "Reviewer") do %>
+                      <a
+                        href={~p"/moderation/ban/#{ban.id}"}
+                        class="btn btn-secondary btn-sm"
+                      >
+                        Show
+                      </a>
+                    <% end %>
+                  </td>
+                </tr>
+              <% end %>
+            </tbody>
+          </table>
+        </div>
+
+        <%= if assigns[:total_pages] do %>
+          <.pagination
+            page={@page}
+            total_pages={@total_pages}
+            base_url={~p"/moderation/ban"}
+            limit={@limit}
+            total_count={@total_count}
+            current_count={@current_count}
+            show_go_to={@total_pages > 5}
+            class="mt-3"
+            include_params={["search", "limit", "name", "order"]}
+            current_params={@conn.params}
+          />
+        <% end %>
+      </div>
+    </div>
+  </div>
+</div>

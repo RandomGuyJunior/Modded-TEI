@@ -1,0 +1,38 @@
+<% bsname = view_colour() %>
+
+{render(
+  TeiserverWeb.Report.GeneralView,
+  "sub_menu.html",
+  Map.merge(assigns, %{active: "reports"})
+)}
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <div
+          class="btn btn-primary2 float-end"
+          onclick="$('.old-help-box, .old-help-box-large').toggle();"
+        >
+          <i class="fa-fw fa-solid fa-circle-info"></i> &nbsp;
+          Show/Hide help
+        </div>
+        <br /><br />
+
+        <.table id="posts" rows={@posts} table_class="table-sm table-hover">
+          <:col :let={post} label="Title">{post.title}</:col>
+          <:col :let={post} label="Poster">{post.poster.name}</:col>
+          <:col :let={post} label="View count">{format_number(post.view_count)}</:col>
+          <:col :let={post} label="Posted">
+            {date_to_str(post.inserted_at, format: :hms_or_ymd)}
+          </:col>
+          <:col :let={post} label="">
+            <a href={~p"/microblog/show/#{post.id}"} class="btn btn-secondary btn-sm">
+              <Fontawesome.icon icon="link" style="regular" />
+            </a>
+          </:col>
+        </.table>
+      </div>
+    </div>
+  </div>
+</div>

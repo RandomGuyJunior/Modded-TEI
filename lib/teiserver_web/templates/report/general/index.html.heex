@@ -1,0 +1,280 @@
+<div class="row mt-2">
+  <%= if allow?(@current_user, "Server") do %>
+    <div class="col-md-12">
+      <h4>Metrics</h4>
+    </div>
+
+    <%= if allow?(@current_user, "Moderator") do %>
+      <.menu_card
+        size={:small}
+        icon={Teiserver.Account.RatingLib.icon()}
+        url={~p"/teiserver/reports/ratings/distribution_table"}
+      >
+        Ratings
+      </.menu_card>
+    <% end %>
+
+    <%= if allow?(@current_user, "Engine") do %>
+      <.menu_card
+        size={:small}
+        icon={Teiserver.Telemetry.InfologLib.icon()}
+        url={~p"/telemetry/infolog"}
+      >
+        Infologs
+      </.menu_card>
+    <% end %>
+
+    <.menu_card
+      size={:small}
+      icon="fa-solid fa-download"
+      url={~p"/teiserver/reports/exports"}
+    >
+      Data exports
+    </.menu_card>
+  <% end %>
+
+  <div class="col-md-12">
+    <h4>Individual users</h4>
+  </div>
+
+  <%= if allow?(@current_user, Teiserver.Account.TimeSpentReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.TimeSpentReport.icon()}
+      url={~p"/teiserver/reports/show/time_spent"}
+    >
+      Time spent
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.RelationshipReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.RelationshipReport.icon()}
+      url={~p"/teiserver/reports/show/relationships"}
+    >
+      Relationships
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.TimeCompareReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.TimeCompareReport.icon()}
+      url={~p"/teiserver/reports/show/time_compare"}
+    >
+      Time compare
+    </.menu_card>
+  <% end %>
+</div>
+
+<div class="row mt-2">
+  <div class="col-md-12">
+    <h4>Account summaries</h4>
+  </div>
+
+  <%= if allow?(@current_user, Teiserver.Account.ActiveReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.ActiveReport.icon()}
+      url={~p"/teiserver/reports/show/active"}
+    >
+      Active
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.UserAgeReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.UserAgeReport.icon()}
+      url={~p"/teiserver/reports/show/user_age"}
+    >
+      User age
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.VerifiedReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.VerifiedReport.icon()}
+      url={~p"/teiserver/reports/show/verified"}
+    >
+      Verified
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.RetentionReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.RetentionReport.icon()}
+      url={~p"/teiserver/reports/show/retention"}
+    >
+      Retention
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.PopulationReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.PopulationReport.icon()}
+      url={~p"/teiserver/reports/show/population"}
+    >
+      Population
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.NewUserFunnelReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.NewUserFunnelReport.icon()}
+      url={~p"/teiserver/reports/show/new_user_funnel"}
+    >
+      New user funnel
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.RecordsReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.RecordsReport.icon()}
+      url={~p"/teiserver/reports/show/records"}
+    >
+      Records
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.NewSmurfReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.NewSmurfReport.icon()}
+      url={~p"/teiserver/reports/show/new_smurf"}
+    >
+      New smurfs
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.BanEvasionReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.BanEvasionReport.icon()}
+      url={~p"/teiserver/reports/show/ban_evasion"}
+    >
+      Ban evasion
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.GrowthReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.GrowthReport.icon()}
+      url={~p"/teiserver/reports/show/growth"}
+    >
+      Growth
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.WeekOnWeekReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.WeekOnWeekReport.icon()}
+      url={~p"/teiserver/reports/show/week_on_week"}
+    >
+      Week on Week
+    </.menu_card>
+  <% end %>
+</div>
+
+<div class="row mt-2">
+  <div class="col-md-12">
+    <h4>Other</h4>
+  </div>
+
+  <%= if allow?(@current_user, Teiserver.Account.AccoladeReport.permissions()) and Application.get_env(:teiserver, Teiserver)[:enable_accolade_mode] == true do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.AccoladeReport.icon()}
+      url={~p"/teiserver/reports/show/accolades"}
+    >
+      Accolades
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.LeaderboardReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.LeaderboardReport.icon()}
+      url={~p"/teiserver/reports/show/leaderboard"}
+    >
+      Leaderboard
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.ReviewReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.ReviewReport.icon()}
+      url={~p"/teiserver/reports/show/review"}
+    >
+      Review
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Account.OpenSkillReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Account.OpenSkillReport.icon()}
+      url={~p"/teiserver/reports/show/open_skill"}
+    >
+      Open Skill
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Game.MappingReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Game.MappingReport.icon()}
+      url={~p"/teiserver/reports/show/mapping"}
+    >
+      Mapping
+    </.menu_card>
+  <% end %>
+
+  <%= if allow?(@current_user, Teiserver.Moderation.ActivityReport.permissions()) do %>
+    <.menu_card
+      size={:small}
+      icon={Teiserver.Moderation.ActivityReport.icon()}
+      url={~p"/teiserver/reports/show/moderation_activity"}
+    >
+      Moderation
+    </.menu_card>
+  <% end %>
+
+  <.menu_card
+    :if={allow?(@current_user, Teiserver.Communication.MicroblogReport.permissions())}
+    icon={Teiserver.Communication.MicroblogReport.icon()}
+    url={~p"/teiserver/reports/show/microblog"}
+    size={:small}
+  >
+    Microblog
+  </.menu_card>
+
+  <.menu_card
+    :if={allow?(@current_user, Teiserver.Account.MFAReport.permissions())}
+    icon={Teiserver.Account.MFAReport.icon()}
+    url={~p"/teiserver/reports/show/mfa"}
+    size={:small}
+  >
+    MFA Usage
+  </.menu_card>
+</div>
+
+<div class="row mt-2">
+  <.menu_card
+    size={:small}
+    icon_class="fa-solid"
+    icon={StylingHelper.icon(:back)}
+    url={~p"/"}
+  >
+    Back
+  </.menu_card>
+</div>

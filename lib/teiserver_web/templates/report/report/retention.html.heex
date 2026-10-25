@@ -1,0 +1,159 @@
+<% bsname = view_colour() %>
+
+{render(
+  TeiserverWeb.Report.GeneralView,
+  "sub_menu.html",
+  Map.merge(assigns, %{active: "reports"})
+)}
+
+<%= if @graph_data do %>
+  <script src={~p"/js/d3.js"}>
+  </script>
+  <script src={~p"/js/c3.min.js"}>
+  </script>
+
+  <link href="/css/c3.min.css" rel="stylesheet" />
+
+  <script>
+    $(function() {
+      var chart = c3.generate({
+        bindto: '#chart',
+        data: {
+          columns: <%= raw Jason.encode!(@graph_data) %>
+        }
+      });
+    });
+  </script>
+<% end %>
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <div
+          class="btn btn-primary2 float-end"
+          onclick="$('.old-help-box, .old-help-box-large').toggle();"
+        >
+          <i class="fa-fw fa-solid fa-circle-info"></i> &nbsp;
+          Show/Hide help
+        </div>
+        <br /><br />
+
+        <form
+          action={~p"/teiserver/reports/show/retention"}
+          method="post"
+          class="form-horizontal"
+        >
+          <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+
+          <div class="row">
+            <div class="col-md-3 col-xl-2 search-form-input">
+              <label for="report_date_preset" class="control-label">Date range:</label>
+              {select(:report, :date_preset, @presets,
+                class: "form-control",
+                selected: @params["date_preset"]
+              )}
+            </div>
+
+            <div class="col-md-3 col-xl-2 search-form-input">
+              <label for="report_start_date" class="control-label">Start date:</label>
+              <input
+                type="text"
+                id="report_start_date"
+                name="report[start_date]"
+                value={@params["start_date"]}
+                class="form-control datepicker"
+              />
+            </div>
+
+            <div class="col-md-3 col-xl-2 search-form-input">
+              <label for="report_end_date" class="control-label">End date:</label>
+              <input
+                type="text"
+                id="report_end_date"
+                name="report[end_date]"
+                value={@params["end_date"]}
+                class="form-control datepicker"
+              />
+            </div>
+
+            <div class="col-md-3 col-xl-2 search-form-input">
+              <label for="report_skip0" class="control-label">Skip day 0:</label>
+              <.input
+                type="checkbox"
+                id="report_skip0"
+                name="report[skip0]"
+                checked={@params["skip0"] == "true"}
+                label="Skip day 0"
+                value="true"
+              />
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="col-md-8 col-xl-9">
+              <div class="old-help-box-large">
+                Lists players that have:
+                <ul>
+                  <li>Have logged in</li>
+                  <li>Are verified</li>
+                  <li>Registered within a certain date range</li>
+                  <li>Have played at least once</li>
+                </ul>
+                If skip0 is set then the 1st day of results will be skipped (the day their account was created) for the graph but the count and % at the bottom will remain.
+              </div>
+            </div>
+
+            <div class="col-md-4 col-xl-3">
+              &nbsp;<br />
+              <input
+                type="submit"
+                value="Update report"
+                name="form.submitted"
+                class={"btn btn-#{bsname} btn-block"}
+              />
+            </div>
+          </div>
+        </form>
+        <br /><br />
+
+        <%= if @graph_data do %>
+          <div class="card-body">
+            <div id="chart" class="with-transitions" style="height: 400px;"></div>
+          </div>
+        <% end %>
+
+        <div class="table-responsive">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>&nbsp;</th>
+                <%= for d <- Range.new(1, @max_key) do %>
+                  <th>{d}</th>
+                <% end %>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Count</td>
+                <%= for d <- Range.new(0, @max_key) do %>
+                  <td>{Map.get(@play_retention_grouping, d, 0)}</td>
+                <% end %>
+              </tr>
+
+              <tr>
+                <td>As %</td>
+                <%= for d <- Range.new(0, @max_key) do %>
+                  <td>
+                    {raw = Map.get(@play_retention_grouping, d, 0) / max(@user_count, 1)
+                    round(raw * 1000) / 10}
+                  </td>
+                <% end %>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

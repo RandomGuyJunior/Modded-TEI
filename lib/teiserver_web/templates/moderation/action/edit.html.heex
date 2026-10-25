@@ -1,0 +1,46 @@
+<% bsname = view_colour() %>
+
+<TeiserverWeb.Moderation.ModerationComponents.sub_menu
+  active="actions"
+  view_colour={view_colour()}
+/>
+
+<div class="row">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <TeiserverWeb.Components.Moderation.ActionComponents.section_menu
+          active="edit"
+          colour={bsname}
+        />
+
+        <hr />
+
+        {render(
+          "form.html",
+          Map.put(assigns, :action, ~p"/moderation/action/#{@action.id}")
+        )}
+
+        <hr />
+        {link(raw("<i class='fa-brands fa-fw fa-discord'></i>&nbsp; Re post to discord"),
+          to: ~p"/moderation/action/re-post/#{@action.id}",
+          method: "put",
+          data: [confirm: "Are you sure (this is only needed if you deleted the post)?"],
+          class: "btn btn-warning"
+        )} &nbsp;&nbsp;&nbsp; {link(
+          raw("<i class='fa-solid fa-fw fa-octagon'></i>&nbsp; Halt action"),
+          to: ~p"/moderation/action/halt/#{@action.id}",
+          method: "put",
+          data: [confirm: "Are you sure?"],
+          class: "btn btn-danger"
+        )} &nbsp;&nbsp;&nbsp; {link(
+          raw("<i class='fa-solid fa-fw fa-trash'></i>&nbsp; Delete action"),
+          to: ~p"/moderation/action/#{@action.id}",
+          method: "delete",
+          data: [confirm: "Are you sure?"],
+          class: "btn btn-danger2"
+        )}
+      </div>
+    </div>
+  </div>
+</div>

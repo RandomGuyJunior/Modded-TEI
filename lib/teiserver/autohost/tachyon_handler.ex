@@ -1,0 +1,414 @@
+defmodule Teiserver.Autohost.TachyonHandler do
+  @moduledoc """
+  Handle a connection with an autohost using the tachyon protocol.
+
+  This is treated separately from a player connection because they fulfill
+  very different roles, have very different behaviour and states.
+  """
+  alias Teiserver.Account.User
+  alias Teiserver.Autohost.Session
+  alias Teiserver.Autohost.SessionSupervisor
+  alias Teiserver.Bot.Bot
+  alias Teiserver.Helpers.Collections
+  alias Teiserver.Helpers.TachyonParser
+  alias Teiserver.Tachyon.Handler
+  alias Teiserver.Tachyon.Schema
+  alias Teiserver.Tachyon.Transport
+  alias Teiserver.TachyonBattle
+
+  require Logger
+  @behaviour Handler
+
+  @type state :: %{
+          autohost: Bot.t(),
+          session_pid: pid(),
+          state: :handshaking | :connected
+        }
+
+  def start_battle(conn_pid, battle_id, start_script, cb_state) do
+    send(conn_pid, {:start_battle, battle_id, start_script, cb_state})
+  end
+
+  @spec subscribe_updates(pid(), DateTime.t()) :: :ok | {:error, reason :: term()}
+  def subscribe_updates(conn_pid, since) do
+    payload = %{since: DateTime.to_unix(since, :microsecond)}
+    response = Transport.call_client(conn_pid, "autohost/subscribeUpdates", payload)
+
+    case response do
+      %{"status" => "failed", "reason" => reason} ->
+        msg =
+          case response["details"] do
+            nil -> reason
+            details -> "#{reason} - #{details}"
+          end
+
+        Logger.error("failed to subscribe to autohost updates: #{inspect(msg)}")
+        {:error, msg}
+
+      %{"status" => "success"} ->
+        :ok
+    end
+  catch
+    # in case the connection is terminating midway
+    :exit, {:normal, _details} -> :ok
+  end
+
+  @doc """
+  send a message to the autohost with the given pid
+  """
+  @spec send_message(pid(), term(), %{battle_id: TachyonBattle.id(), message: String.t()}) ::
+          :ok
+  def send_message(conn_pid, cb_state, payload) when is_pid(conn_pid) do
+    send(conn_pid, {:send_message, cb_state, payload})
+  end
+
+  @spec kill_battle(pid(), term(), TachyonBattle.id()) :: :ok | {:error, reason :: term()}
+  def kill_battle(conn_pid, cb_state, battle_id) when is_pid(conn_pid) do
+    send(conn_pid, {:kill_battle, cb_state, battle_id})
+  end
+
+  @spec add_player(pid(), term(), TachyonBattle.Types.add_player_data()) ::
+          :ok | {:error, reason :: term()}
+  def add_player(conn_pid, cb_state, add_data) do
+    send(conn_pid, {:add_player, cb_state, add_data})
+  end
+
+  @impl Handler
+  def connect(conn) do
+    autohost = conn.assigns[:token].bot
+    {:ok, %{autohost: autohost, state: :handshaking}}
+  end
+
+  @impl Handler
+  @spec init(state()) :: Handler.result()
+  def init(state) do
+    Logger.metadata(actor_type: :autohost_conn, actor_id: state.autohost.id)
+
+    case SessionSupervisor.start_session(state.autohost, self()) do
+      {:ok, session_pid} ->
+        state = Map.put(state, :session_pid, session_pid)
+        {:ok, state}
+
+      {:error, reason} ->
+        Logger.warning("Cannot start autohost session: #{inspect(reason)}")
+        {:stop, :normal, state}
+    end
+  end
+
+  @impl Handler
+  def handle_info({:start_battle, battle_id, start_script, cb_state}, state) do
+    mappings = %{
+      engine_version: :engineVersion,
+      game_name: :gameName,
+      map_name: :mapName,
+      start_pos_type: :startPosType,
+      ally_teams:
+        {:allyTeams,
+         %{
+           teams:
+             {:teams,
+              %{players: {:players, &player_to_tachyon/1}, bots: {:bots, &bot_to_tachyon/1}}},
+           start_box: {:startBox, %{top: :top, left: :left, bottom: :bottom, right: :right}}
+         }},
+      game_options: :gameOptions,
+      spectators: {:spectators, &player_to_tachyon/1}
+    }
+
+    start_script =
+      start_script
+      |> Collections.transform_map(mappings)
+      |> Collections.remove_nil_vals()
+      |> Map.put(:battleId, battle_id)
+
+    opts = [cb_state: cb_state]
+    {:request, "autohost/start", start_script, opts, state}
+  end
+
+  def handle_info({:send_message, ref, payload}, state) do
+    payload = %{battleId: payload.battle_id, message: payload.message}
+    opts = [cb_state: ref]
+    {:request, "autohost/sendMessage", payload, opts, state}
+  end
+
+  def handle_info({:kill_battle, ref, battle_id}, state) do
+    opts = [cb_state: ref]
+    {:request, "autohost/kill", %{battleId: battle_id}, opts, state}
+  end
+
+  def handle_info({:add_player, ref, data}, state) do
+    mappings = %{
+      battle_id: "battleId",
+      user_id: {"userId", &to_string/1},
+      name: "name",
+      password: "password"
+    }
+
+    tachyon_data = Collections.transform_map(data, mappings)
+    opts = [cb_state: ref]
+    {:request, "autohost/addPlayer", tachyon_data, opts, state}
+  end
+
+  def handle_info(_msg, state) do
+    {:ok, state}
+  end
+
+  @impl Handler
+  @spec handle_command(
+          Schema.command_id(),
+          Schema.message_type(),
+          Schema.message_id(),
+          term(),
+          state()
+        ) :: WebSock.handle_result()
+
+  def handle_command("system/disconnect", "request", _message_id, _message, state) do
+    {:stop, :normal, state}
+  end
+
+  def handle_command("autohost/status", "event", _msg_id, msg, %{state: :handshaking} = state) do
+    %{"data" => %{"maxBattles" => max_battles, "currentBattles" => current}} = msg
+    Session.update_capacity(state.session_pid, max_battles, current)
+    state = %{state | state: :connected}
+    {:ok, state}
+  end
+
+  def handle_command("autohost/status", "event", _msg_id, msg, state) do
+    %{"data" => %{"maxBattles" => max_battles, "currentBattles" => current}} = msg
+    Session.update_capacity(state.session_pid, max_battles, current)
+    state = %{state | state: :connected}
+    {:ok, state}
+  end
+
+  def handle_command(
+        command_id,
+        _message_type,
+        message_id,
+        _message,
+        %{state: :handshaking} = state
+      ) do
+    resp =
+      Schema.error_response(
+        command_id,
+        message_id,
+        :invalid_request,
+        "The first message after connection must be `status`"
+      )
+      |> Jason.encode!()
+
+    # 1000 = close normal
+    {:stop, :normal, 1000, [{:text, resp}], state}
+  end
+
+  def handle_command("autohost/update", "event", msg_id, msg, state) do
+    parsed = parse_update_event(msg_id, msg["data"])
+    Logger.debug("parsed message #{inspect(parsed)}")
+
+    case parsed do
+      {:ok, ev} ->
+        Session.handle_update_event(state.session_pid, ev)
+        {:ok, state}
+
+      {:error, reason} ->
+        Logger.error("error parsing event: #{inspect(reason)} - #{inspect(msg["data"])}")
+        {:stop, {:shutdown, {:error, reason}}, state}
+    end
+  end
+
+  def handle_command(_command_id, _message_type, _message_id, _message, state) do
+    {:error_response, :command_unimplemented, state}
+  end
+
+  @impl Handler
+  def handle_response("autohost/start", _battle_id, _resp, state) when state.session_pid == nil,
+    do: {:ok, state}
+
+  def handle_response("autohost/" <> command, cb_state, response, state)
+      when command in ["start", "sendMessage", "kill", "addPlayer"] do
+    resp =
+      case response["status"] do
+        "success" ->
+          parse_response(command, response["data"])
+
+        "failed" ->
+          err = response["reason"]
+
+          case Map.get(response, "details") do
+            nil -> {:error, err}
+            details -> {:error, "#{err} - #{details}"}
+          end
+      end
+
+    Session.async_reply(state.session_pid, cb_state, resp)
+    {:ok, state}
+  end
+
+  @type update_event_data ::
+          {:player_joined, %{user_id: User.id(), player_number: integer()}}
+          | {:player_left, %{user_id: User.id(), reason: :lost_connection | :left | :kicked}}
+          | {:player_defeated, %{user_id: User.id()}}
+          | :start
+          | {:finished, %{user_id: User.id(), winning_ally_teams: nonempty_list(integer())}}
+          | {:engine_message, %{message: String.t()}}
+          | {:engine_warning, %{message: String.t()}}
+          | {:engine_crash, %{details: String.t() | nil}}
+          | {:player_chat_broadcast,
+             %{
+               destination: :allies | :all | :spectators,
+               message: String.t(),
+               user_id: User.id()
+             }}
+          | {:player_chat_dm, %{message: String.t(), user_id: User.id(), to_user_id: User.id()}}
+          | :engine_quit
+          | {:luamsg,
+             %{
+               user_id: User.id(),
+               script: :ui | :game | :rules,
+               ui_mode: :all | :allies | :spectators | nil,
+               data: String.t()
+             }}
+  @type update_event :: %{
+          message_id: Schema.message_id(),
+          battle_id: TachyonBattle.id(),
+          time: DateTime.t(),
+          update: update_event_data()
+        }
+
+  # Note: this is not truly parsing, but more translating a known structure into
+  # something more idiomatic. The json schema handle the actual validation so
+  # when this function is called, the structure is known
+  @doc false
+  @spec parse_update_event(Schema.message_id(), map()) ::
+          {:ok, update_event()} | {:error, reason :: term()}
+  def parse_update_event(msg_id, data) do
+    update = data["update"]
+
+    user_id =
+      case Map.get(update, "userId") do
+        nil -> {:ok, nil}
+        raw -> TachyonParser.parse_user_id(raw)
+      end
+
+    with {:ok, time} <- DateTime.from_unix(data["time"], :microsecond),
+         {:ok, user_id} <- user_id do
+      base = %{message_id: msg_id, battle_id: data["battleId"], time: time}
+
+      case update["type"] do
+        "player_joined" ->
+          update = {:player_joined, %{user_id: user_id, player_number: update["playerNumber"]}}
+          {:ok, Map.put(base, :update, update)}
+
+        "player_left" ->
+          reason =
+            case update["reason"] do
+              "lost_connection" -> :lost_connection
+              "left" -> :left
+              "kicked" -> :kicked
+            end
+
+          update = {:player_left, %{user_id: user_id, reason: reason}}
+          {:ok, Map.put(base, :update, update)}
+
+        "player_chat" ->
+          if update["destination"] == "player" do
+            case TachyonParser.parse_user_id(update["toUserId"]) do
+              {:ok, id} ->
+                update =
+                  {:player_chat_dm,
+                   %{message: update["message"], user_id: user_id, to_user_id: id}}
+
+                {:ok, Map.put(base, :update, update)}
+
+              err ->
+                err
+            end
+          else
+            dest =
+              case update["destination"] do
+                "allies" -> :allies
+                "all" -> :all
+                "spectators" -> :spectators
+              end
+
+            update =
+              {:player_chat_broadcast,
+               %{destination: dest, message: update["message"], user_id: user_id}}
+
+            {:ok, Map.put(base, :update, update)}
+          end
+
+        "player_defeated" ->
+          update = {:player_defeated, %{user_id: user_id}}
+          {:ok, Map.put(base, :update, update)}
+
+        "start" ->
+          {:ok, Map.put(base, :update, :start)}
+
+        "finished" ->
+          update =
+            {:finished, %{user_id: user_id, winning_ally_teams: update["winningAllyTeams"]}}
+
+          {:ok, Map.put(base, :update, update)}
+
+        "engine_message" ->
+          update = {:engine_message, %{message: update["message"]}}
+          {:ok, Map.put(base, :update, update)}
+
+        "engine_warning" ->
+          {:engine_warning, %{message: update["message"]}}
+          {:ok, Map.put(base, :update, update)}
+
+        "engine_crash" ->
+          {:engine_warning, %{details: Map.get(update, "details")}}
+          {:ok, Map.put(base, :update, update)}
+
+        "engine_quit" ->
+          {:ok, Map.put(base, :update, :engine_quit)}
+
+        "luamsg" ->
+          script =
+            case update["script"] do
+              "ui" -> :ui
+              "game" -> :game
+              "rules" -> :rules
+            end
+
+          ui_mode =
+            case Map.get(update, "uiMode") do
+              nil -> nil
+              "all" -> :all
+              "allies" -> :allies
+              "spectators" -> :spectators
+            end
+
+          {:luamsg, %{user_id: user_id, script: script, ui_mode: ui_mode, data: update["data"]}}
+          {:ok, Map.put(base, :update, update)}
+      end
+    end
+  end
+
+  def player_to_tachyon(p) when is_list(p), do: Enum.map(p, &player_to_tachyon/1)
+
+  def player_to_tachyon(p) do
+    %{
+      userId: to_string(p.user_id),
+      name: p.name,
+      password: p.password
+    }
+  end
+
+  def bot_to_tachyon(b) when is_list(b), do: Enum.map(b, &bot_to_tachyon/1)
+
+  def bot_to_tachyon(b) do
+    %{
+      hostUserId: to_string(b.host_user_id),
+      aiShortName: b.ai_short_name,
+      name: b.name
+    }
+  end
+
+  defp parse_response("start", data) do
+    {:ok, %{ips: data["ips"], port: data["port"]}}
+  end
+
+  defp parse_response(_command, nil), do: :ok
+end

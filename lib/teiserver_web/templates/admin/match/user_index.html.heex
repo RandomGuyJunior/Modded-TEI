@@ -1,0 +1,118 @@
+<% bsname = view_colour() %>
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <TeiserverWeb.Components.Admin.MatchComponents.section_menu
+          active="user"
+          colour={bsname}
+          current_user={@current_user}
+        />
+
+        <div class="float-end">
+          <.section_menu_button
+            icon={Teiserver.Account.RatingLib.icon()}
+            bsname={bsname}
+            url={~p"/teiserver/admin/users/ratings/#{@user.id}"}
+          >
+            Rated matches
+          </.section_menu_button>
+
+          <.section_menu_button
+            icon={Teiserver.Account.UserLib.icon()}
+            bsname={bsname}
+            url={~p"/teiserver/admin/user/#{@user.id}"}
+          >
+            View user
+          </.section_menu_button>
+        </div>
+        <br /><br />
+
+        <h4>Listing Matches</h4>
+
+        <div class="table-responsive">
+          <table class="table table-sm">
+            <thead>
+              <tr>
+                <th>Type</th>
+                <th>Map</th>
+                <th>Outcome</th>
+                <th>Teams</th>
+                <th>Team size</th>
+                <th>Duration (mins)</th>
+                <th>Finished</th>
+                <th>&nbsp;</th>
+              </tr>
+            </thead>
+            <tbody>
+              <%= for match <- @matches do %>
+                <% member_ids =
+                  match.members
+                  |> Enum.filter(fn mm -> mm.user_id == @user.id end)
+
+                win =
+                  case member_ids do
+                    [] -> false
+                    [member] -> match.winning_team == member.team_id
+                  end %>
+
+                <tr>
+                  <td>{match.game_type}</td>
+                  <td>{match.map}</td>
+
+                  <td>
+                    <%= cond do %>
+                      <% win -> %>
+                        Won
+                      <% match.data["export_data"]["result"] == "undecided" -> %>
+                        Undecided
+                      <% true -> %>
+                        &nbsp;
+                    <% end %>
+                  </td>
+
+                  <td>{match.team_count}</td>
+                  <td>{match.team_size}</td>
+
+                  <td>
+                    <%= case {match.finished, match.started} do %>
+                      <% {nil, _} -> %>
+                        Never finished
+                      <% {_, nil} -> %>
+                        Never started
+                      <% _ -> %>
+                        {DateTime.diff(match.finished, match.started, :minute)}
+                    <% end %>
+                  </td>
+                  <td>{date_to_str(match.finished, format: :ymd_hms)}</td>
+
+                  <td>
+                    <a href={~p"/battle/#{match.id}"} class="btn btn-secondary btn-sm">
+                      Show
+                    </a>
+                  </td>
+                </tr>
+              <% end %>
+            </tbody>
+          </table>
+        </div>
+
+        <%= if assigns[:total_pages] do %>
+          <.pagination
+            page={@page}
+            total_pages={@total_pages}
+            base_url={~p"/teiserver/admin/matches/user/#{@user.id}"}
+            limit={@limit}
+            total_count={@total_count}
+            current_count={@current_count}
+            show_go_to={@total_pages > 5}
+            class="mt-3"
+            include_params={["limit"]}
+            current_params={%{"limit" => @limit}}
+          />
+        <% end %>
+      </div>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,135 @@
+<div class="row">
+  <div class="col-md-12 col-lg-6">
+    <table class="table table-sm">
+      <tbody>
+        <tr>
+          <td>Report by</td>
+          <td>
+            {@report.reporter.name}, {date_to_str(@report.inserted_at,
+              format: :hms_or_dmy
+            )}
+          </td>
+        </tr>
+
+        <tr>
+          <td>Type:</td>
+          <td>{@report.type}/{@report.sub_type}</td>
+        </tr>
+        <tr>
+          <td>Extra text:</td>
+          <td>{@report.extra_text}</td>
+        </tr>
+        <tr>
+          <td>Report date:</td>
+          <td>{date_to_str(@report.inserted_at, format: :ymd_hms, tz: @tz)}</td>
+        </tr>
+
+        <%= if @report.match_id do %>
+          <tr>
+            <td>Match:</td>
+            <td>
+              <a href={~p"/battle/#{@report.match_id}"} class="btn btn-secondary btn-sm">
+                Details
+              </a>
+              &nbsp;&nbsp;
+              <a
+                href={
+                  ~p"/battle/chat/#{@report.match_id}/#{@report.target_id}/#{@report.reporter_id}"
+                }
+                class="btn btn-secondary btn-sm"
+              >
+                Chat
+              </a>
+            </td>
+          </tr>
+          <tr>
+            <td>Relationship:</td>
+            <td>{@report.relationship}</td>
+          </tr>
+        <% end %>
+        <tr>
+          <td>Replay search:</td>
+          <td>
+            <a
+              href={"https://bar-rts.com/replays/?players=#{
+                @report.target.name}&date=#{date_to_str((if @report.match, do: @report.match.started, else: @report.inserted_at), format: :ymd, tz: @tz)
+              }" <>
+              (if @report.match, do: "&maps=#{@report.match.map}", else: "") }
+              class="btn btn-secondary btn-sm"
+            >
+              Reported player
+            </a>
+            <a
+              href={"https://bar-rts.com/replays/?players=#{
+                @report.target.name}&players=#{@report.reporter.name}&
+                date=#{date_to_str((if @report.match, do: @report.match.started, else: @report.inserted_at), format: :ymd, tz: @tz)
+              }" <>
+              (if @report.match, do: "&maps=#{@report.match.map}", else: "") }
+              class="btn btn-secondary btn-sm"
+            >
+              Both players
+            </a>
+            <a
+              href={"https://bar-rts.com/replays/?players=#{
+                @report.reporter.name}&
+                date=#{date_to_str((if @report.match, do: @report.match.started, else: @report.inserted_at), format: :ymd, tz: @tz)
+              }" <>
+              (if @report.match, do: "&maps=#{@report.match.map}", else: "") }
+              class="btn btn-secondary btn-sm"
+            >
+              Reporter
+            </a>
+          </td>
+        </tr>
+        <%= if @report.result_id do %>
+          <tr>
+            <td>Result</td>
+            <td>
+              <a
+                href={~p"/moderation/action/#{@report.result_id}"}
+                class="btn btn-secondary btn-sm"
+              >
+                View details
+              </a>
+            </td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  </div>
+
+  <%= if not @report.closed do %>
+    <div class="col-md-12 col-lg-6">
+      <h4>Your response</h4>
+      {render(
+        "response_form.html",
+        Map.put(assigns, :action, ~p"/moderation/report/#{@report.id}/respond")
+      )}
+
+      <h4>Responses</h4>
+      <h6>Accuracy: {@accuracy}%</h6>
+
+      <table class="table table-sm">
+        <thead>
+          <tr>
+            <th></th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <%= for {action, icon} <- Teiserver.Moderation.ResponseLib.list_actions() do %>
+            <tr>
+              <td>
+                <i class={"fa-fw #{icon}"}></i>
+                {action}
+              </td>
+              <td>
+                {@response_action_counts[action] || 0}
+              </td>
+            </tr>
+          <% end %>
+        </tbody>
+      </table>
+    </div>
+  <% end %>
+</div>

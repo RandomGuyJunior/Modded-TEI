@@ -1,0 +1,44 @@
+<% {fg, _bg, _bsname} = view_colour(@active) |> colours() %>
+
+<style>
+  .sub-menu-icon a:hover {
+    border-bottom: 5px solid <%= fg %>;
+    color: <%= fg %>;
+  }
+
+  .sub-menu-icon .active {
+    border-bottom-color: <%= fg %>;
+  }
+
+  .sub-menu .active, .sub-menu .active:hover {
+    color: <%= fg %>;
+  }
+</style>
+
+<div class="row sub-menu">
+  <div class="col-md-12">
+    <div class="card card-default">
+      <div class="card-body" style="padding: 0 15px;">
+        <div class="row">
+          <.sub_menu_button
+            active={@active == "exports"}
+            url={~p"/teiserver/reports/exports"}
+            icon="fa-solid fa-download"
+          >
+            Data exports
+          </.sub_menu_button>
+
+          <%= if allow_any?(@conn, ~w(Contributor Overwatch)) do %>
+            <.sub_menu_button
+              active={@active == "reports"}
+              url={~p"/teiserver/reports"}
+              icon={Teiserver.Helper.StylingHelper.icon(:report)}
+            >
+              Reports
+            </.sub_menu_button>
+          <% end %>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

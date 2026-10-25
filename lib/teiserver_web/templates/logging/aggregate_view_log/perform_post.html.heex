@@ -1,0 +1,30 @@
+<% bsname = view_colour() %>
+
+{render(
+  TeiserverWeb.Logging.GeneralView,
+  "sub_menu.html",
+  Map.merge(assigns, %{active: "aggregate"})
+)}
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <TeiserverWeb.Components.Logging.AggregateViewLogComponents.section_menu
+          active="perform"
+          colour={bsname}
+        />
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname} page-card"}>
+      <div class="card-body">
+        Success
+      </div>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,25 @@
+{
+  "skip_files": [
+    "lib/teiserver/benchmark/*",
+    "lib/teiserver/data/hook_server.ex",
+    "lib/teiserver/agents/*",
+    "^test/.*",
+    "^/.*_web.ex",
+    ".*_test_lib.ex"
+  ],
+
+  "custom_stop_words": [
+    "GenServer.start_link\\(__MODULE__, \\[\\], opts\\)"
+  ],
+
+  "terminal_options": {
+    "file_column_width": 100
+  },
+
+  "coverage_options": {
+    "treat_no_relevant_lines_as_covered": true,
+    "output_dir": "cover/",
+    "minimum_coverage": 30
+  }
+}
+

@@ -1,0 +1,67 @@
+<% bsname = view_colour() %>
+
+<div class="row mt-3">
+  <div class="col-md-12 col-xl-6 offset-xl-3">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <h4>Edit site config - {config_name(@config_info.key)}</h4>
+        {@config_info.description}
+        <br /><br />
+
+        <form action={~p"/teiserver/admin/site/#{@key}"} method="post" class="">
+          <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+          <input type="hidden" name="_method" value="PUT" />
+          <input type="hidden" name="site_config[x]" value="x" />
+
+          <div class="form-group my-4">
+            <%= case @config_info.type do %>
+              <% "select" -> %>
+                <.input
+                  type="select"
+                  id="site_config_value"
+                  name="site_config[value]"
+                  value={@value}
+                  options={
+                    for(
+                      v <- @config_info.opts[:choices],
+                      do: %{id: v, name: v, colour: "#555555", icon: "fa-solid fa-square"}
+                    )
+                  }
+                />
+              <% "boolean" -> %>
+                <.input
+                  type="checkbox"
+                  id="site_config_value"
+                  name="site_config[value]"
+                  checked={@value}
+                  label={@config_info[:value_label] || "Value"}
+                  value={true}
+                />
+              <% _ -> %>
+                <label for="control_id" class="col-sm-2 control-label">Value</label>
+                <input
+                  type="text"
+                  name="site_config[value]"
+                  id="site_config_value"
+                  value={@value}
+                  class="form-control"
+                />
+            <% end %>
+          </div>
+          <br /><br />
+
+          <a
+            href={~p"/teiserver/admin/site/"}
+            class="float-start btn btn-secondary"
+          >
+            Cancel
+          </a>
+
+          <button type="submit" class={"btn btn-#{bsname} float-end"}>
+            Save changes
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>

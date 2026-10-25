@@ -1,0 +1,39 @@
+defmodule Teiserver.Battle.ExportAggregateMatchMetricsTask do
+  @moduledoc false
+  alias Teiserver.Helper.DateHelper
+  alias Teiserver.Helper.DatePresets
+  alias Teiserver.Logging
+
+  def perform(params) do
+    {start_date, end_date} =
+      DatePresets.parse(
+        params["date_preset"],
+        params["start_date"],
+        params["end_date"]
+      )
+
+    start_date = DateHelper.to_datetime(start_date)
+    end_date = DateHelper.to_datetime(end_date)
+
+    Logging.list_server_day_logs(
+      search: [
+        start_date: start_date,
+        end_date: end_date
+      ],
+      limit: :infinity,
+      order: "Oldest first"
+    )
+    |> do_output(params)
+  end
+
+  defp do_output(data, _params) do
+    data
+    |> Stream.map(fn log ->
+      log.data
+      |> Map.drop(["minutes_per_user", "old_minutes_per_user"])
+      |> Map.put("date", log.date)
+    end)
+    |> Enum.to_list()
+    |> Jason.encode!()
+  end
+end

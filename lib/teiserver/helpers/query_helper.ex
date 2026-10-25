@@ -1,0 +1,122 @@
+defmodule Teiserver.Helper.QueryHelpers do
+  @moduledoc false
+  alias Teiserver.Repo
+  import Ecto.Query, warn: false
+
+  @type t :: Query.t()
+
+  defmacro lower(field) do
+    quote do
+      fragment("LOWER(?)", unquote(field))
+    end
+  end
+
+  defmacro stddev_pop(field) do
+    quote do
+      fragment("stddev_pop(?)", unquote(field))
+    end
+  end
+
+  defmacro between(field, low, high) do
+    quote do
+      fragment("? BETWEEN ? AND ?", unquote(field), unquote(low), unquote(high))
+    end
+  end
+
+  defmacro array_remove(field, value) do
+    quote do
+      fragment("array_remove(?, ?)", unquote(field), unquote(value))
+    end
+  end
+
+  defmacro array_agg(field) do
+    quote do
+      fragment("array_agg(?)", unquote(field))
+    end
+  end
+
+  defmacro array_overlap_a_in_b(a, b) do
+    quote do
+      fragment("? \\?| ?", unquote(a), unquote(b))
+    end
+  end
+
+  defmacro extract_year(field) do
+    quote do
+      fragment("EXTRACT(YEAR FROM ?)", unquote(field))
+    end
+  end
+
+  defmacro extract_month(field) do
+    quote do
+      fragment("EXTRACT(MONTH FROM ?)", unquote(field))
+    end
+  end
+
+  defmacro extract_week(field) do
+    quote do
+      fragment("EXTRACT(WEEK FROM ?)", unquote(field))
+    end
+  end
+
+  defmacro extract_hour(field) do
+    quote do
+      fragment("EXTRACT(HOUR FROM ?)", unquote(field))
+    end
+  end
+
+  defmacro date_trunc(period, field) do
+    quote do
+      fragment("date_trunc(?, ?)", unquote(period), unquote(field))
+    end
+  end
+
+  def count(table) do
+    Repo.aggregate(table, :count, :id)
+  end
+
+  @spec offset_query(Ecto.Query.t(), nil | Integer.t()) :: Ecto.Query.t()
+  def offset_query(query, nil), do: query
+
+  def offset_query(query, amount) do
+    query
+    |> offset(^amount)
+  end
+
+  @spec limit_query(Ecto.Query.t(), Integer.t() | :infinity) :: Ecto.Query.t()
+  def limit_query(query, :infinity), do: query
+  def limit_query(query, nil), do: query
+
+  def limit_query(query, amount) do
+    query
+    |> limit(^amount)
+  end
+
+  @spec limit_query(Ecto.Query.t(), integer() | nil, integer() | nil) :: Ecto.Query.t()
+  def limit_query(query, nil, max_amount), do: limit_query(query, max_amount)
+
+  def limit_query(query, amount, max_amount) when is_integer(amount) do
+    limit_query(query, min(amount, max_amount))
+  end
+
+  def limit_query(query, amount, max_amount) do
+    limit_query(query, min(amount |> String.to_integer(), max_amount))
+  end
+
+  @spec query_select(Ecto.Query.t(), String.t() | nil) :: Ecto.Query.t()
+  def query_select(query, nil), do: query
+
+  def query_select(query, fields) do
+    from stat_grids in query,
+      select: ^fields
+  end
+
+  @spec paginate(t(), non_neg_integer(), pos_integer()) :: t()
+  def paginate(query, page, page_size) do
+    offset = page * page_size
+
+    query
+    |> offset_query(offset)
+    |> limit_query(page_size)
+  end
+end

@@ -1,0 +1,61 @@
+defmodule Teiserver.Moderation.Action do
+  @moduledoc false
+
+  alias Ecto.Changeset
+  alias Teiserver.Helper.DateHelper
+
+  use TeiserverWeb, :schema
+
+  typed_schema "moderation_actions" do
+    belongs_to :target, Teiserver.Account.User
+    field :reason, :string
+    field :appeal_status, :string
+    field :notes, :string
+    field :restrictions, {:array, :string}
+    field :score_modifier, :integer
+    field :expires, :naive_datetime
+
+    field :hidden, :boolean, default: false
+
+    field :discord_message_id, :integer
+
+    timestamps()
+  end
+
+  @spec changeset(map(), map()) :: Changeset.t()
+  def changeset(struct, params \\ %{}) do
+    params =
+      params
+      |> trim_strings(~w(reason notes)a)
+
+    struct
+    |> cast(
+      params,
+      ~w(target_id reason restrictions score_modifier expires notes hidden discord_message_id appeal_status)a
+    )
+    |> validate_required(~w(target_id reason restrictions expires score_modifier)a)
+    |> adjust_restrictions()
+    |> validate_length(:restrictions, min: 1)
+  end
+
+  defp adjust_restrictions(%Ecto.Changeset{} = struct) do
+    years = DateTime.shift(DateTime.utc_now(), year: 10)
+    expires = Changeset.get_field(struct, :expires, [])
+    inbound_restrictions = Changeset.get_field(struct, :restrictions, [])
+
+    new_restrictions =
+      if DateHelper.greater_than(expires, years) and Enum.member?(inbound_restrictions, "Login") do
+        ["Permanently banned" | inbound_restrictions] |> Enum.uniq()
+      else
+        (inbound_restrictions || []) |> List.delete("Permanently banned")
+      end
+
+    Changeset.put_change(struct, :restrictions, new_restrictions)
+  end
+
+  @spec authorize(atom(), Plug.Conn.t(), map()) :: bool()
+  def authorize(:index, conn, _params), do: allow?(conn, "Overwatch")
+  def authorize(:search, conn, _params), do: allow?(conn, "Overwatch")
+  def authorize(:show, conn, _params), do: allow?(conn, "Overwatch")
+  def authorize(_action, conn, _params), do: allow?(conn, "Moderator")
+end

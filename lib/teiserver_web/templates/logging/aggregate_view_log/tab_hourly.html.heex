@@ -1,0 +1,83 @@
+<% bsname = view_colour() %>
+
+<style type="text/css">
+  .hourly-view-date {
+    /*
+    font-size: 0.9em;
+    */
+  }
+
+  .hourly-view-cell {
+    color: #FFF;
+    text-shadow: 0px 0px #000;
+    font-weight: bold;
+    font-size: 0.9em;
+  }
+</style>
+
+<span class={"btn btn-#{bsname}"} onclick='$(".hourly-view-span").show();'>
+  <i class="fa-fw fa-solid fa-eye"></i> Show numbers
+</span>
+
+<span class={"btn btn-#{bsname}"} onclick='$(".hourly-view-span").hide();'>
+  <i class="fa-fw fa-solid fa-eye-slash"></i> Hide numbers
+</span>
+
+<div class="col-md-12">
+  <table class="table table-sm" class="heatmap-table">
+    <thead>
+      <tr>
+        <th>&nbsp;</th>
+
+        <%= for i <- 0..23 do %>
+          <th>{i}</th>
+        <% end %>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Views</td>
+        <% maximum = Enum.reduce(@log.hourly_views, 0, &max/2) %>
+        <%= for i <- 0..23 do %>
+          <td
+            class="hourly-view-cell"
+            style={"background-color: ##{heatmap(Enum.fetch!(@log.hourly_views, i), maximum, "black-red")};"}
+          >
+            <span class="hourly-view-span">
+              {Enum.fetch!(@log.hourly_views, i) |> round() |> format_number()}
+            </span>
+          </td>
+        <% end %>
+      </tr>
+      <tr>
+        <td>Uniques</td>
+        <% maximum = Enum.reduce(@log.hourly_uniques, 0, &max/2) %>
+        <%= for i <- 0..23 do %>
+          <td
+            class="hourly-view-cell"
+            style={"background-color: ##{heatmap(Enum.fetch!(@log.hourly_uniques, i), maximum, "black-red")};"}
+          >
+            <span class="hourly-view-span">
+              {Enum.fetch!(@log.hourly_uniques, i) |> round() |> format_number()}
+            </span>
+          </td>
+        <% end %>
+      </tr>
+      <tr>
+        <td>Load (ms)</td>
+        <% maximum = Enum.reduce(@log.hourly_average_load_times, 0, &max/2) %>
+
+        <%= for i <- 0..23 do %>
+          <td
+            class="hourly-view-cell"
+            style={"background-color: ##{heatmap(Enum.fetch!(@log.hourly_average_load_times, i), maximum, "black-red")};"}
+          >
+            <span class="hourly-view-span">
+              {convert_load_time(Enum.fetch!(@log.hourly_average_load_times, i))}
+            </span>
+          </td>
+        <% end %>
+      </tr>
+    </tbody>
+  </table>
+</div>

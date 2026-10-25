@@ -1,0 +1,549 @@
+defmodule TeiserverWeb.NavComponents do
+  @moduledoc false
+  alias Phoenix.LiveView.JS
+
+  use Phoenix.Component
+
+  use Phoenix.VerifiedRoutes,
+    endpoint: TeiserverWeb.Endpoint,
+    router: TeiserverWeb.Router,
+    statics: TeiserverWeb.static_paths()
+
+  import Teiserver.Account.AuthLib, only: [allow?: 2, allow_any?: 2]
+  import Phoenix.HTML, only: [raw: 1]
+
+  @doc """
+  <TeiserverWeb.NavComponents.top_nav_item active={active} route={route} icon={icon} />
+  """
+  def top_nav_item(assigns) do
+    active = if assigns[:active], do: "active", else: ""
+
+    assigns =
+      assigns
+      |> assign(:active, active)
+
+    ~H"""
+    <li class="nav-item">
+      <a class={"nav-link #{@active}"} href={@route}>
+        <%= if assigns[:icon] do %>
+          <i class={"fa-fw #{@icon}"}></i>
+        <% end %>
+        {@text}
+      </a>
+    </li>
+    """
+  end
+
+  @doc """
+  <TeiserverWeb.NavComponents.top_navbar active={"string"} />
+  """
+  attr :current_user, :map, required: true
+  attr :active, :string, required: true
+
+  def top_navbar(assigns) do
+    ~H"""
+    <nav class="navbar navbar-expand-lg m-0 p-0" id="top-nav">
+      <!-- Container wrapper -->
+      <div class="container-fluid">
+        <!-- Navbar brand -->
+        <a class="navbar-brand" href="/">
+          <img src={~p"/images/logo/logo.svg"} alt="BAR Logo" style="height: 24px; width: auto;" />
+        </a>
+
+        <button
+          class="navbar-toggler"
+          type="button"
+          data-bs-toggle="collapse"
+          data-bs-target="#navbarSupportedContent"
+          aria-controls="navbarSupportedContent"
+          aria-expanded="false"
+          aria-label="Toggle navigation"
+        >
+          <span class="navbar-toggler-icon"></span>
+        </button>
+
+        <div class="collapse navbar-collapse" id="navbarSupportedContent">
+          <!-- Left navigation -->
+          <ul class="navbar-nav me-auto">
+            <.top_nav_item text="Home" active={@active == "central_home"} route={~p"/"} />
+
+            <.top_nav_item
+              text={raw("My&nbsp;Account")}
+              active={@active == "teiserver_account"}
+              route={~p"/profile"}
+            />
+
+            <.top_nav_item text="Blog" active={@active == "microblog"} route={~p"/microblog"} />
+
+            <.top_nav_item
+              :if={@current_user}
+              text="Chat"
+              active={@active == "chat"}
+              route={~p"/chat"}
+            />
+
+            <.top_nav_item
+              :if={allow?(@current_user, "Server")}
+              text="Logging"
+              active={@active == "logging"}
+              route={~p"/logging"}
+            />
+
+            <.top_nav_item text="Lobbies" active={@active == "lobbies"} route={~p"/battle/lobbies"} />
+
+            <.top_nav_item text="Matches" route={~p"/battle"} active={@active == "match"} />
+
+            <.top_nav_item
+              text="Leaderboard"
+              route={~p"/battle/ratings/leaderboard"}
+              active={@active == "leaderboard"}
+            />
+
+            <.top_nav_item
+              :if={allow_any?(@current_user, ~w(Contributor Overwatch))}
+              text="Reports"
+              route={~p"/teiserver/reports"}
+              active={@active == "teiserver_report"}
+            />
+
+            <.top_nav_item
+              :if={allow?(@current_user, "Moderator")}
+              text="Users"
+              route={~p"/teiserver/admin/user"}
+              active={@active == "teiserver_user"}
+            />
+
+            <.top_nav_item
+              :if={allow?(@current_user, "Overwatch")}
+              text="Moderation"
+              route={~p"/moderation"}
+              active={@active == "moderation"}
+            />
+
+            <.top_nav_item
+              :if={allow_any?(@current_user, ~w(Contributor))}
+              text="Admin"
+              route={~p"/admin"}
+              active={@active == "admin"}
+            />
+          </ul>
+          <!-- Left navigation -->
+
+          <!-- Right elements -->
+          <ul class="navbar-nav">
+            <%= if @current_user do %>
+              <TeiserverWeb.UserComponents.recents_dropdown current_user={@current_user} />
+              <TeiserverWeb.UserComponents.account_dropdown current_user={@current_user} />
+            <% else %>
+              <li class="nav-item">
+                <a class="nav-link" href={~p"/login"}>
+                  Sign in
+                </a>
+              </li>
+            <% end %>
+          </ul>
+          <!-- Right elements -->
+        </div>
+        <!-- Collapsible wrapper -->
+      </div>
+    </nav>
+    """
+  end
+
+  @doc """
+  <TeiserverWeb.NavComponents.top_navbar_tw active={"string"} />
+  """
+  attr :scope, :map, default: nil
+  attr :current_user, :map, default: nil
+  attr :active, :string, required: true
+
+  def top_navbar_tw(assigns) do
+    ~H"""
+    <nav>
+      <ul class="menu menu-horizontal w-full relative z-10 flex items-center gap-4 px-4 sm:px-6 lg:px-8 justify-end">
+        <li>
+          <%!--
+            Setting this to false for now as it will not correctly select dark CSS in some cases
+          --%>
+          <button
+            :if={false}
+            class="flex p-2 cursor-pointer [[data-theme=system]_&]:bg-blue-900"
+            phx-click={JS.dispatch("phx:set-theme")}
+            data-phx-theme="system"
+          >
+            <Fontawesome.icon icon="desktop" style="solid" class="opacity-75 hover:opacity-100" />
+          </button>
+        </li>
+        <li>
+          <button
+            class="flex p-2 cursor-pointer [[data-theme=light]_&]:bg-blue-200"
+            phx-click={JS.dispatch("phx:set-theme")}
+            data-phx-theme="light"
+          >
+            <Fontawesome.icon icon="sun" style="solid" class="opacity-75 hover:opacity-100" />
+          </button>
+        </li>
+        <li>
+          <button
+            class="flex p-2 cursor-pointer [[data-theme=dark]_&]:bg-blue-900"
+            phx-click={JS.dispatch("phx:set-theme")}
+            data-phx-theme="dark"
+          >
+            <Fontawesome.icon icon="moon" style="solid" class="opacity-75 hover:opacity-100" />
+          </button>
+        </li>
+        <li class={[@active == "home" && "menu-active"]}>
+          <.link href={~p"/"}>Home</.link>
+        </li>
+        <li class={[@active == "microblog" && "menu-active"]}>
+          <.link href={~p"/microblog"}>Blog</.link>
+        </li>
+        <%= if @current_user || @scope do %>
+          <li class={[@active == "chat" && "menu-active"]}>
+            <.link href={~p"/chat"}>Chat</.link>
+          </li>
+
+          <li
+            :if={allow?(@current_user || @scope, "Server")}
+            class={[@active == "logging" && "menu-active"]}
+          >
+            <.link href={~p"/logging"}>Logging</.link>
+          </li>
+
+          <li class={[@active == "lobbies" && "menu-active"]}>
+            <.link href={~p"/battle/lobbies"}>Lobbies</.link>
+          </li>
+
+          <li class={[@active == "match" && "menu-active"]}>
+            <.link href={~p"/battle"}>Matches</.link>
+          </li>
+
+          <li class={[@active == "leaderboard" && "menu-active"]}>
+            <.link href={~p"/battle/ratings/leaderboard"}>Leaderboard</.link>
+          </li>
+
+          <li
+            :if={allow_any?(@current_user || @scope, ["Contributor", "Overwatch"])}
+            class={[@active == "reports" && "menu-active"]}
+          >
+            <.link href={~p"/teiserver/reports"}>Reports</.link>
+          </li>
+
+          <li
+            :if={allow?(@current_user || @scope, "Moderator")}
+            class={[@active == "users" && "menu-active"]}
+          >
+            <.link href={~p"/teiserver/admin/user"}>Users</.link>
+          </li>
+
+          <li
+            :if={allow?(@current_user || @scope, "Overwatch")}
+            class={[@active == "moderation" && "menu-active"]}
+          >
+            <.link href={~p"/moderation"}>Moderation</.link>
+          </li>
+
+          <li
+            :if={allow?(@current_user || @scope, "Contributor")}
+            class={[@active == "admin" && "menu-active"]}
+          >
+            <.link href={~p"/admin"}>Admin</.link>
+          </li>
+
+          <li>
+            <.link href={~p"/logout"} method="delete">Log out</.link>
+          </li>
+        <% else %>
+          <li class={[@active == "login" && "menu-active"]}>
+            <.link href={~p"/login"}>Log in</.link>
+          </li>
+        <% end %>
+      </ul>
+    </nav>
+    """
+  end
+
+  @doc """
+  <.tab_header>
+    <.tab_nav tab="h1">Header 1</.tab_nav>
+    <.tab_nav tab="h2">Header 2</.tab_nav>
+    <.tab_nav tab="h3">Header 3</.tab_nav>
+  </.tab_header>
+  """
+  # attr :selected, :string, required: :true
+  slot :inner_block, required: true
+
+  def tab_header(assigns) do
+    ~H"""
+    <ul class="nav nav-tabs" role="tablist">
+      {render_slot(@inner_block)}
+    </ul>
+    """
+  end
+
+  attr :selected, :boolean, required: true
+  attr :url, :string, required: true
+  slot :inner_block, required: true
+
+  def tab_nav(assigns) do
+    assigns =
+      assigns
+      |> assign(:active_class, if(assigns[:selected], do: "active"))
+
+    ~H"""
+    <li class="nav-item">
+      <.link patch={@url} class={"nav-link #{@active_class}"}>
+        {render_slot(@inner_block)}
+      </.link>
+    </li>
+    """
+  end
+
+  @doc """
+  <.menu_card
+    icon="icon"
+    url={~p""}
+    size={:auto | :small | :medium | :large | nil}
+  >
+    Text here
+  </.menu_card>
+  """
+  attr :url, :string, required: true
+  attr :icon, :string, required: true
+  attr :icon_class, :string, default: "solid"
+  attr :size, :atom, default: nil
+  slot :inner_block, required: true
+
+  def menu_card(assigns) do
+    style =
+      cond do
+        assigns[:disabled] -> "color: #888; cursor: default;"
+        assigns[:style] -> assigns[:style]
+        true -> ""
+      end
+
+    extra_classes = assigns[:class] || ""
+
+    col_classes =
+      case assigns[:size] do
+        :auto -> "col"
+        :small -> "col-sm-6 col-md-4 col-lg-2 col-xl-1 col-xxl-1"
+        :medium -> "col-sm-6 col-md-4 col-lg-3 col-xl-2 col-xxl-1"
+        :large -> "col-sm-6 col-md-6 col-lg-4 col-xl-3 col-xxl-2"
+        nil -> assigns[:col_classes] || "col-sm-6 col-md-4 col-lg-3 col-xl-2 col-xxl-1"
+      end
+
+    icon_size =
+      case assigns[:size] do
+        :small -> "fa-3x"
+        :auto -> "fa-4x"
+        :medium -> "fa-4x"
+        :large -> "fa-6x"
+        nil -> assigns[:col_classes] || "fa-4x"
+      end
+
+    assigns =
+      assigns
+      |> assign(:col_classes, col_classes)
+      |> assign(:extra_classes, extra_classes)
+      |> assign(:icon_size, icon_size)
+      |> assign(:style, style)
+
+    ~H"""
+    <div class={"#{@col_classes} menu-card #{@extra_classes}"}>
+      <a href={@url} class="block-link" style={@style}>
+        <Fontawesome.icon icon={@icon} style={@icon_class} size={@icon_size} /><br />
+        {render_slot(@inner_block)}
+      </a>
+    </div>
+    """
+  end
+
+  @doc """
+  A square link used on menu pages, typically as part of a grid layout div.
+
+  <.menu_page_link
+    icon="icon"
+    url={~p""}
+  >
+    Text here
+  </.menu_page_link>
+  """
+  attr :url, :string, required: true
+  attr :icon, :string, required: true
+  attr :icon_class, :string, default: "solid"
+  attr :size, :atom, default: nil
+  slot :inner_block, required: true
+
+  def menu_page_link(assigns) do
+    ~H"""
+    <a href={@url} class="menu-link">
+      <Fontawesome.icon icon={@icon} size="4x" /><br />
+      <div class="mt-4 text-lg">{render_slot(@inner_block)}</div>
+    </a>
+    """
+  end
+
+  @doc """
+  <.sub_menu_button bsname={bsname} icon={lib} active={true/false} url={url}>
+    Text goes here
+  </.sub_menu_button>
+  """
+  attr :icon, :string, default: nil
+  attr :url, :string, required: true
+  attr :bsname, :string, default: "secondary"
+  attr :active, :boolean, default: false
+  slot :inner_block, required: true
+
+  def sub_menu_button(assigns) do
+    assigns =
+      assigns
+      |> assign(:active_class, if(assigns[:active], do: "active"))
+
+    ~H"""
+    <div class="col sub-menu-icon">
+      <a href={@url} class={"block-link #{@active_class}"}>
+        <Fontawesome.icon :if={@icon} icon={@icon} style="solid" size="2x" /><br />
+        {render_slot(@inner_block)}
+      </a>
+    </div>
+    """
+  end
+
+  @doc """
+  <.section_menu_button bsname={bsname} icon={lib} active={true/false} url={url}>
+    Text goes here
+  </.section_menu_button>
+  """
+  attr :icon, :string, default: nil
+  attr :url, :string, required: true
+  attr :bsname, :string, default: "secondary"
+  attr :active, :boolean, default: false
+  slot :inner_block, required: true
+
+  def section_menu_button(assigns) do
+    assigns =
+      assigns
+      |> assign(:active_class, if(assigns[:active], do: "active"))
+
+    ~H"""
+    <.link navigate={@url} class={"btn btn-outline-#{@bsname} #{@active_class}"}>
+      <Fontawesome.icon :if={@icon} icon={@icon} style="solid" /> &nbsp; {render_slot(@inner_block)}
+    </.link>
+    """
+  end
+
+  @doc """
+  <.section_menu_button_patch bsname={bsname} icon={lib} active={true/false} url={url}>
+    Text goes here
+  </.section_menu_button_patch>
+
+  <.section_menu_button_patch
+      bsname={@view_colour}
+      icon={StylingHelper.icon(:list)}
+      active={@active == "index"}
+      url={~p"/account/relationship"}
+    >
+      List
+    </.section_menu_button_patch>
+  """
+  attr :icon, :string, default: nil
+  attr :url, :string, required: true
+  attr :bsname, :string, default: "secondary"
+  attr :active, :boolean, default: false
+  slot :inner_block, required: true
+
+  def section_menu_button_patch(assigns) do
+    assigns =
+      assigns
+      |> assign(:active_class, if(assigns[:active], do: "active"))
+
+    ~H"""
+    <.link patch={@url} class={"btn btn-outline-#{@bsname} #{@active_class}"}>
+      <Fontawesome.icon :if={@icon} icon={@icon} style={if @active, do: "solid", else: "regular"} />
+      {render_slot(@inner_block)}
+    </.link>
+    """
+  end
+
+  @doc """
+  <.tw_section_menu_button bsname={bsname} icon={lib} active={true/false} url={url}>
+    Text goes here
+  </.tw_section_menu_button>
+  """
+  attr :icon, :string, default: nil
+  attr :url, :string, required: true
+  attr :active, :boolean, default: false
+  slot :inner_block, required: true
+
+  def tw_section_menu_button(assigns) do
+    assigns =
+      assigns
+      |> assign(:active_class, if(assigns[:active], do: "tab-active"))
+
+    ~H"""
+    <a href={@url} class={["tab", @active_class]}>
+      <Fontawesome.icon :if={@icon} icon={@icon} style="solid" /> &nbsp; {render_slot(@inner_block)}
+    </a>
+    """
+  end
+
+  @doc """
+  <.section_menu_link bsname={bsname} icon={lib} active={true/false} url={url}>
+    Text goes here
+  </.section_menu_link>
+  """
+  attr :icon, :string, default: nil
+  attr :url, :string, required: true
+  attr :active, :boolean, default: false
+  slot :inner_block, required: true
+
+  def section_menu_link(assigns) do
+    assigns =
+      assigns
+      |> assign(:active_class, if(assigns[:active], do: "active"))
+
+    ~H"""
+    <li>
+      <a href={@url} class={["tab", @active_class]}>
+        <Fontawesome.icon :if={@icon} icon={@icon} style="solid" /> &nbsp; {render_slot(@inner_block)}
+      </a>
+    </li>
+    """
+  end
+
+  @doc """
+  <.breadcrumb_trail trails={@breadcrumb_trails} />
+  """
+  def breadcrumb_trail(assigns) do
+    ~H"""
+    <nav class="navbar navbar-expand-lg" id="breadcrumb-wrapper" aria-label="breadcrumb">
+      <div class="container-fluid">
+        <nav aria-label="breadcrumb">
+          <%= for breadcrumb_trail <- @trails do %>
+            <ol class="breadcrumb">
+              <%= for breadcrumb <- breadcrumb_trail do %>
+                <%= if breadcrumb[:url] == "#" do %>
+                  <li class="breadcrumb-item active" aria-current="page">
+                    <a href={breadcrumb[:url]}>{breadcrumb[:name]}</a>
+                  </li>
+                <% else %>
+                  <li class="breadcrumb-item">
+                    <a href={breadcrumb[:url]}>{breadcrumb[:name]}</a>
+                  </li>
+                <% end %>
+              <% end %>
+            </ol>
+          <% end %>
+        </nav>
+
+        <%= if assigns[:breadcrumb_extra] do %>
+          <div id="breadcrumb-right">
+            {assigns[:breadcrumb_extra]}
+          </div>
+        <% end %>
+      </div>
+    </nav>
+    """
+  end
+end

@@ -1,0 +1,41 @@
+<% bsname = view_colour() %>
+
+<.section_menu_button
+  active={@active == "summary"}
+  icon={Teiserver.Helper.StylingHelper.icon(:summary)}
+  bsname={bsname}
+  url={~p"/telemetry/simple_lobby_events/summary"}
+>
+  Summary
+</.section_menu_button>
+
+<.section_menu_button
+  active={@active == "export"}
+  icon={Teiserver.Helper.StylingHelper.icon(:export)}
+  bsname={bsname}
+  url={~p"/telemetry/simple_lobby_events/export/form"}
+>
+  Export
+</.section_menu_button>
+
+<%= if @active == "property_detail" do %>
+  <.section_menu_button
+    active={@active == "property_detail"}
+    icon={Teiserver.Helper.StylingHelper.icon(:detail)}
+    bsname={bsname}
+    url="#"
+  >
+    Property detail
+  </.section_menu_button>
+<% end %>
+
+<%= if @active == "event_detail" do %>
+  <.section_menu_button
+    active={@active == "event_detail"}
+    icon={Teiserver.Helper.StylingHelper.icon(:detail)}
+    bsname={bsname}
+    url="#"
+  >
+    Event detail
+  </.section_menu_button>
+<% end %>

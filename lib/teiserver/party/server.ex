@@ -1,0 +1,730 @@
+defmodule Teiserver.Party.Server do
+  @moduledoc """
+  transient state machine to hold a party state and mediate player interactions
+  """
+
+  alias Plug.Crypto
+  alias Teiserver.Account.User
+  alias Teiserver.Config
+  alias Teiserver.Helpers.MonitorCollection, as: MC
+  alias Teiserver.KvStore
+  alias Teiserver.Matchmaking
+  alias Teiserver.Messaging
+  alias Teiserver.Party
+  alias Teiserver.Party.Event
+  alias Teiserver.Party.Events
+  alias Teiserver.Party.Types, as: PT
+  alias Teiserver.Player
+  alias Teiserver.Tachyon
+
+  require Logger
+
+  @behaviour :gen_statem
+
+  @default_call_timeout 5000
+
+  @spec gen_party_id() :: PT.Data.id()
+  def gen_party_id, do: UUID.uuid4()
+
+  @doc """
+  What is the site config key holding the max size of a party
+  """
+  def max_size_key, do: "party.max-size"
+
+  @doc """
+  What is the site config key holding how long an invite is valid for (in seconds)
+  """
+  def invite_valid_duration_key, do: "party.invite-valid-duration-s"
+
+  @spec leave_party(PT.Data.id(), User.id()) :: :ok | {:error, :invalid_party | :not_a_member}
+  def leave_party(party_id, user_id) do
+    via_tuple(party_id) |> :gen_statem.call({:leave, user_id}, @default_call_timeout)
+  catch
+    :exit, {:noproc, _details} -> {:error, :invalid_party}
+    :exit, {:shutdown, _reason} -> :ok
+  end
+
+  @doc """
+  To be called when the system is starting up and recovering from a restart.
+  The player has to already be in the party (member or invited).
+  """
+  @spec rejoin(PT.Data.id(), User.id(), pid() | nil) ::
+          {:ok, PT.Overview.t()} | {:error, :invalid_party | :not_a_member}
+  def rejoin(party_id, user_id, pid \\ self()) do
+    via_tuple(party_id) |> :gen_statem.call({:rejoin, user_id, pid}, @default_call_timeout)
+  catch
+    :exit, {:noproc, _details} -> {:error, :invalid_party}
+  end
+
+  @doc """
+  Create an invite for the given player, ensuring they're not already part of the party
+  """
+  @spec create_invite(PT.Data.id(), User.id()) ::
+          {:ok, PT.Overview.t()}
+          | {:error, :invalid_party | :already_invited | :party_at_capacity}
+  def create_invite(party_id, user_id, pid \\ self()) do
+    via_tuple(party_id) |> :gen_statem.call({:create_invite, user_id, pid}, @default_call_timeout)
+  catch
+    :exit, {:noproc, _details} -> {:error, :invalid_party}
+  end
+
+  @spec accept_invite(PT.Data.id(), User.id()) ::
+          {:ok, PT.Overview.t()} | {:error, :invalid_party | :not_invited}
+  def accept_invite(party_id, user_id) do
+    via_tuple(party_id)
+    |> :gen_statem.call(
+      {:accept_invite, user_id, self()},
+      @default_call_timeout
+    )
+  catch
+    :exit, {:noproc, _details} -> {:error, :invalid_party}
+  end
+
+  @spec decline_invite(PT.Data.id(), User.id()) ::
+          {:ok, PT.Overview.t()} | {:error, :invalid_party | :not_invited}
+  def decline_invite(party_id, user_id) do
+    via_tuple(party_id) |> :gen_statem.call({:decline_invite, user_id}, @default_call_timeout)
+  catch
+    :exit, {:noproc, _details} -> {:error, :invalid_party}
+  end
+
+  @doc """
+  cancel a pending invite. Any member can do that
+  """
+  @spec cancel_invite(PT.Data.id(), User.id()) ::
+          {:ok, PT.Overview.t()} | {:error, :invalid_party | :not_in_party | :not_invited}
+  def cancel_invite(party_id, user_id) do
+    via_tuple(party_id) |> :gen_statem.call({:cancel_invite, user_id}, @default_call_timeout)
+  catch
+    :exit, {:noproc, _details} -> {:error, :invalid_party}
+  end
+
+  @doc """
+  Kick the specified member from the party. The user doing the kicking must
+  be a member of the party (and not merely invited)
+  """
+  @spec kick_user(PT.Data.id(), user_kicking :: User.id(), kicked_user :: User.id()) ::
+          {:ok, PT.Overview.t()} | {:error, :invalid_party | :invalid_target | :not_a_member}
+  def kick_user(party_id, actor_id, target_id) do
+    via_tuple(party_id)
+    |> :gen_statem.call(
+      {:kick_user, actor_id, target_id},
+      @default_call_timeout
+    )
+  catch
+    :exit, {:noproc, _details} -> {:error, :invalid_party}
+  end
+
+  @doc """
+  Get the public party data
+  """
+  @spec get_overview(PT.Data.id()) :: PT.Overview.t() | nil
+  def get_overview(party_id) do
+    via_tuple(party_id) |> :gen_statem.call(:get_overview, @default_call_timeout)
+  catch
+    :exit, {:noproc, _details} -> nil
+  end
+
+  @doc """
+  Make all the members of the party join the specified matchmaking queues.
+  The party server will only notify the members that they should join the
+  specified queues.
+
+  Once the party is in matchmaking, it is "locked", all invites are cancelled
+  and no new invites can be sent.
+  We may revisit this decision later, but for now it drastically simplify the
+  interactions between parties and matchmaking by removing any potential of a
+  party member already being in matchmaking outside the party.
+  """
+  @spec join_queues(PT.Data.id(), [Matchmaking.queue_ref()]) ::
+          :ok | {:error, reason :: term()}
+  def join_queues(party_id, queues) do
+    via_tuple(party_id)
+    |> :gen_statem.call(
+      {:join_matchmaking_queues, queues},
+      @default_call_timeout
+    )
+  catch
+    :exit, {:noproc, _details} -> {:error, :invalid_party}
+  end
+
+  @doc """
+  Let the party know that it is no longer in matchmaking. The responsibility
+  to let the player know falls upon the matchmaking system, this is only
+  to set the party state.
+  """
+  @spec matchmaking_notify_cancel(PT.Data.id()) :: :ok
+  def matchmaking_notify_cancel(party_id) do
+    via_tuple(party_id) |> :gen_statem.cast(:lost_matchmaking_queue)
+  end
+
+  @spec send_message(PT.Data.id(), User.id(), String.t()) ::
+          :ok | {:error, :invalid_request, reason :: term()}
+  def send_message(party_id, from_id, msg_content) do
+    via_tuple(party_id)
+    |> :gen_statem.call(
+      {:send_message, from_id, msg_content},
+      @default_call_timeout
+    )
+  catch
+    :exit, {:noproc, _details} -> {:error, :invalid_request, "invalid party"}
+  end
+
+  def child_spec({party_id, _init_arg} = args) do
+    %{
+      id: via_tuple(party_id),
+      start: {__MODULE__, :start_link, [args]},
+      restart: :temporary
+    }
+  end
+
+  def start_link({party_id, _init_arg} = args) do
+    via_tuple(party_id) |> :gen_statem.start_link(__MODULE__, args, [])
+  end
+
+  ################################################################################
+  #                                                                              #
+  #                                  INTERNALS                                   #
+  #                                                                              #
+  ################################################################################
+
+  @impl :gen_statem
+  def callback_mode, do: :handle_event_function
+
+  @impl :gen_statem
+  def init({party_id, {:user, user_id, creator_pid}}) do
+    Process.flag(:trap_exit, true)
+    Logger.metadata(actor_type: :party, actor_id: party_id)
+
+    data =
+      %PT.Data{
+        version: 0,
+        id: party_id,
+        members: %{},
+        max_members: Config.get_site_config_cache(max_size_key())
+      }
+      |> add_member(user_id, creator_pid)
+
+    {:ok, :running, data}
+  end
+
+  def init({party_id, {:snapshot, serialized_state}}) do
+    Process.flag(:trap_exit, true)
+    Logger.metadata(actor_type: :party, actor_id: party_id)
+    Logger.debug("Restoring party from snapshot")
+
+    snapshot = Crypto.non_executable_binary_to_term(serialized_state, [:safe])
+    now = DateTime.utc_now()
+
+    expired_invite_ids =
+      Enum.filter(snapshot.invited, fn {_id, i} -> not DateTime.before?(now, i.valid_until) end)
+      |> Enum.map(fn {id, _invite} -> id end)
+      |> MapSet.new()
+
+    invited =
+      for {id, i} <- snapshot.invited, not MapSet.member?(expired_invite_ids, id), into: %{} do
+        duration = max(1, DateTime.diff(i.valid_until, now))
+        tref = :timer.send_after(duration, {:invite_timeout, i.id})
+        {id, Map.put(i, :timeout_ref, tref)}
+      end
+
+    data = %PT.Data{
+      version: snapshot.version,
+      id: party_id,
+      members: snapshot.members,
+      ids_to_rejoin: MapSet.difference(snapshot.ids_to_rejoin, expired_invite_ids),
+      invited: invited,
+      # no restoration of matchmaking yet
+      matchmaking: nil,
+      max_members: Config.get_site_config_cache(max_size_key())
+    }
+
+    timeout = Tachyon.get_restoration_timeout()
+    actions = [{:state_timeout, timeout, :snapshot_timeout}]
+
+    {:ok, :starting_up, data, actions}
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, :get_overview, _state, %PT.Data{} = data) do
+    {:keep_state, data, [{:reply, from, overview_from_data(data)}]}
+  end
+
+  def handle_event({:call, from}, {:leave, user_id}, :running, %PT.Data{} = data) do
+    aggregate = process_events(data, [%Events.Leave{leaver_id: user_id}])
+
+    if aggregate.data == data do
+      {:keep_state, data, [{:reply, from, {:error, :not_a_member}}]}
+    else
+      {:keep_state, aggregate.data, [{:reply, from, :ok} | aggregate.actions]}
+    end
+  end
+
+  def handle_event(
+        {:call, from},
+        {:create_invite, _user_id, _user_pid},
+        :running,
+        %PT.Data{} = data
+      )
+      when data.matchmaking != nil,
+      do: {:keep_state, data, [{:reply, from, {:error, :party_in_matchmaking}}]}
+
+  def handle_event(
+        {:call, from},
+        {:create_invite, user_id, user_pid},
+        :running,
+        %PT.Data{} = data
+      ) do
+    invited = Map.get(data.invited, user_id)
+    member = Map.get(data.members, user_id)
+
+    cond do
+      invited != nil || member != nil ->
+        {:keep_state, data, [{:reply, from, {:error, :already_invited}}]}
+
+      Enum.count(data.invited) + Enum.count(data.members) >= data.max_members ->
+        {:keep_state, data, [{:reply, from, {:error, :party_at_capacity}}]}
+
+      true ->
+        valid_duration = Config.get_site_config_cache(invite_valid_duration_key())
+        valid_until = DateTime.add(DateTime.utc_now(), valid_duration, :second)
+        tref = :timer.send_after(valid_duration * 1000, {:invite_timeout, user_id})
+
+        invite = %{
+          id: user_id,
+          invited_at: DateTime.utc_now(),
+          valid_until: valid_until,
+          timeout_ref: tref
+        }
+
+        new_data =
+          data
+          |> Map.update!(:invited, &Map.put(&1, user_id, invite))
+          |> Map.update!(:monitors, &MC.monitor(&1, user_pid, {:invite, user_id}))
+          |> bump()
+
+        # don't send the updated event to the newly invited player
+        for id <- Map.keys(data.invited) |> Stream.concat(Map.keys(data.members)) do
+          Player.party_notify_updated(id, overview_from_data(new_data))
+        end
+
+        {:keep_state, new_data, [{:reply, from, {:ok, overview_from_data(new_data)}}]}
+    end
+  end
+
+  def handle_event(
+        {:call, from},
+        {:accept_invite, user_id, user_pid},
+        :running,
+        %PT.Data{} = data
+      ) do
+    case Map.pop(data.invited, user_id) do
+      {nil, _invited} ->
+        {:keep_state, data, [{:reply, from, {:error, :not_invited}}]}
+
+      {_invite, rest} ->
+        data =
+          data
+          |> bump()
+          |> Map.put(:invited, rest)
+          |> add_member(user_id, user_pid)
+
+        notify_updated(data)
+        {:keep_state, data, [{:reply, from, {:ok, overview_from_data(data)}}]}
+    end
+  end
+
+  def handle_event({:call, from}, {:decline_invite, user_id}, :running, %PT.Data{} = data) do
+    case Map.pop(data.invited, user_id) do
+      {nil, _invited} ->
+        {:keep_state, data, [{:reply, from, {:error, :not_invited}}]}
+
+      {invited, rest} ->
+        :timer.cancel(invited.timeout_ref)
+
+        data =
+          data
+          |> Map.update!(:monitors, fn mc ->
+            MC.demonitor_by_val(mc, {:invite, user_id})
+          end)
+          |> bump()
+          |> Map.put(:invited, rest)
+
+        notify_updated(data)
+
+        {:keep_state, data, [{:reply, from, {:ok, overview_from_data(data)}}]}
+    end
+  end
+
+  def handle_event({:call, from}, {:cancel_invite, user_id}, :running, %PT.Data{} = data) do
+    case Map.get(data.invited, user_id) do
+      nil ->
+        {:keep_state, data, [{:reply, from, {:error, :not_invited}}]}
+
+      invite ->
+        data = cancel_invite_internal(invite, data)
+        {:keep_state, data, [{:reply, from, {:ok, overview_from_data(data)}}]}
+    end
+  end
+
+  def handle_event({:call, from}, {:kick_user, actor_id, target_id}, :running, %PT.Data{} = data) do
+    member? = Map.has_key?(data.members, actor_id)
+    {target, rest} = Map.pop(data.members, target_id)
+
+    case {member?, target} do
+      {false, _target} ->
+        {:keep_state, data, [{:reply, from, {:error, :not_a_member}}]}
+
+      {_is_member, nil} ->
+        {:keep_state, data, [{:reply, from, {:error, :invalid_target}}]}
+
+      {true, _member} ->
+        data =
+          data
+          |> bump()
+          |> Map.update!(:monitors, &MC.demonitor_by_val(&1, {:member, target_id}))
+          |> Map.put(:members, rest)
+
+        Player.party_notify_removed(target_id, overview_from_data(data))
+        notify_updated(data)
+        {:keep_state, data, [{:reply, from, {:ok, overview_from_data(data)}}]}
+    end
+  end
+
+  def handle_event(
+        {:call, from},
+        {:join_matchmaking_queues, _queues},
+        :running,
+        %PT.Data{} = data
+      )
+      when not is_nil(data.matchmaking),
+      do: {:keep_state, data, [{:reply, from, {:error, :already_queued}}]}
+
+  def handle_event({:call, from}, {:join_matchmaking_queues, queues}, :running, %PT.Data{} = data) do
+    members_id = Map.keys(data.members)
+
+    result =
+      Enum.reduce_while(queues, data.monitors, fn {q_id, version}, monitors ->
+        case Matchmaking.party_join_queue(q_id, version, data.id, members_id) do
+          {:ok, queue_pid} ->
+            {:cont, MC.monitor(monitors, queue_pid, {:queue, q_id})}
+
+          {:error, reason} ->
+            {:halt, {:error, reason, monitors}}
+        end
+      end)
+
+    case result do
+      {:error, reason, monitors} ->
+        # for simplicity, just demonitor everything, even if the queue may not
+        # have been joined yet
+        data =
+          Map.replace!(
+            data,
+            :monitors,
+            Enum.reduce(queues, monitors, &MC.demonitor_by_val(&2, {:queue, elem(&1, 0)}))
+          )
+
+        {:keep_state, data, [{:reply, from, {:error, reason}}]}
+
+      monitors ->
+        data =
+          data
+          |> bump()
+          |> Map.replace!(:monitors, monitors)
+          |> Map.replace!(:matchmaking, %{queues: queues})
+
+        # when entering matchmaking, "lock" the party, all invites are cancelled
+        data =
+          Enum.reduce(data.invited, data, fn {_user_id, invite}, data ->
+            cancel_invite_internal(invite, data)
+          end)
+
+        for id <- Map.keys(data.members) do
+          Player.party_notify_join_queues(id, queues, overview_from_data(data))
+        end
+
+        {:keep_state, data, [{:reply, from, :ok}]}
+    end
+  end
+
+  def handle_event(
+        {:call, from},
+        {:send_message, from_id, msg_content},
+        :running,
+        %PT.Data{} = data
+      ) do
+    case Map.get(data.members, from_id) do
+      nil ->
+        {:keep_state, data, [{:reply, from, {:error, :invalid_request, :not_a_party_member}}]}
+
+      _member ->
+        msg =
+          Messaging.new(
+            msg_content,
+            {:party, data.id, from_id},
+            :erlang.monotonic_time(:micro_seconds)
+          )
+
+        for id <- Map.keys(data.members), id != from_id do
+          Messaging.send(msg, {:player, id})
+        end
+
+        {:keep_state, data, [{:reply, from, :ok}]}
+    end
+  end
+
+  def handle_event(:cast, :lost_matchmaking_queue, :running, %PT.Data{} = data)
+      when data.matchmaking == nil,
+      do: {:keep_state, data}
+
+  def handle_event(:cast, :lost_matchmaking_queue, :running, %PT.Data{} = data) do
+    monitors =
+      Enum.reduce(data.matchmaking.queues, data.monitors, fn queue_id, mc ->
+        MC.demonitor_by_val(mc, {:queue, queue_id})
+      end)
+
+    {:keep_state, %{data | monitors: monitors, matchmaking: nil}}
+  end
+
+  def handle_event({:call, from}, {:rejoin, user_id, user_pid}, :starting_up, %PT.Data{} = data) do
+    if MapSet.member?(data.ids_to_rejoin, user_id) do
+      data =
+        data
+        |> Map.update!(:ids_to_rejoin, &MapSet.delete(&1, user_id))
+        |> Map.update!(:monitors, fn mc ->
+          val =
+            if is_map_key(data.members, user_id),
+              do: {:member, user_id},
+              else: {:invite, user_id}
+
+          MC.monitor(mc, user_pid, val)
+        end)
+
+      actions = [{:reply, from, {:ok, overview_from_data(data)}}]
+
+      if MapSet.size(data.ids_to_rejoin) == 0 do
+        Logger.debug("all member rejoined, start up completed")
+        {:next_state, :running, data, actions}
+      else
+        {:keep_state, data, actions}
+      end
+    else
+      {:keep_state, data, [{:reply, from, {:error, :not_a_member}}]}
+    end
+  end
+
+  def handle_event({:call, from}, {:rejoin, _user_id}, _state, %PT.Data{} = data) do
+    {:keep_state, data, [{:reply, from, {:error, :invalid_party}}]}
+  end
+
+  def handle_event(:info, {:invite_timeout, user_id}, :running, %PT.Data{} = data) do
+    case Map.get(data.invited, user_id) do
+      nil ->
+        {:keep_state, data}
+
+      invite ->
+        data = cancel_invite_internal(invite, data)
+        {:keep_state, data}
+    end
+  end
+
+  def handle_event(:info, {:DOWN, ref, :process, _pid, :shutdown}, state, %PT.Data{} = data) do
+    val = MC.get_val(data.monitors, ref)
+    data = Map.update!(data, :monitors, &MC.demonitor_by_val(&1, val))
+
+    data =
+      case val do
+        {:invite, user_id} when is_map_key(data.invited, user_id) ->
+          Map.update!(data, :ids_to_rejoin, &MapSet.put(&1, user_id))
+
+        {:member, user_id} when is_map_key(data.members, user_id) ->
+          Map.update!(data, :ids_to_rejoin, &MapSet.put(&1, user_id))
+
+        _other ->
+          data
+      end
+
+    case {state, val} do
+      {:running, val} when val != nil -> {:next_state, :shutting_down, data}
+      _other_state -> {:keep_state, data}
+    end
+  end
+
+  # when the reason isn't :shutdown, assume a crash from the peer and fix state accordingly
+  def handle_event(:info, {:DOWN, ref, :process, _pid, _reason}, :running, %PT.Data{} = data) do
+    val = MC.get_val(data.monitors, ref)
+    data = Map.update!(data, :monitors, &MC.demonitor_by_val(&1, val))
+
+    data =
+      case val do
+        nil ->
+          data
+
+        {:invite, user_id} ->
+          Map.update!(data, :invited, &Map.delete(&1, user_id))
+          |> notify_updated()
+
+        {:member, user_id} ->
+          Map.update!(data, :members, &Map.delete(&1, user_id))
+          |> notify_updated()
+
+        {:queue, _qid} ->
+          %{data | matchmaking: nil}
+      end
+
+    if Enum.empty?(data.members),
+      do: {:stop, :normal, data},
+      else: {:keep_state, data}
+  end
+
+  def handle_event({:call, from}, _event, :shutting_down, %PT.Data{} = data) do
+    {:keep_state, data, [{:reply, from, {:error, :party_shutting_down}}]}
+  end
+
+  def handle_event({:call, _from}, _event, :starting_up, %PT.Data{} = data) do
+    {:keep_state, data, [:postpone]}
+  end
+
+  def handle_event(:info, _event, :starting_up, %PT.Data{} = data) do
+    {:keep_state, data, [:postpone]}
+  end
+
+  def handle_event(:internal, :empty, _state, %PT.Data{} = data) do
+    {:stop, {:shutdown, :empty}, data}
+  end
+
+  def handle_event(:state_timeout, :snapshot_timeout, :starting_up, %PT.Data{} = data) do
+    Logger.warning("failed to recover before time out. Missing #{inspect(data.ids_to_rejoin)}")
+    {:stop, :normal}
+  end
+
+  def handle_event(:info, {:EXIT, _pid, reason}, _state, %PT.Data{} = _data) do
+    {:stop, reason}
+  end
+
+  @impl :gen_statem
+  def terminate(:shutdown, :shutting_down, %PT.Data{} = data) do
+    # by that time, the party should have received all the :shutdown signals
+    cond do
+      MapSet.size(data.ids_to_rejoin) != Enum.count(data.members) + Enum.count(data.invited) ->
+        Logger.warning("Missing ids to rejoin, refusing to snapshot invalid state")
+
+      Tachyon.should_restore_state?() ->
+        to_save =
+          data
+          |> Map.take([:version, :members, :ids_to_rejoin, :invited])
+          |> Map.update!(:invited, fn invited ->
+            Enum.map(invited, fn {user_id, invite} ->
+              {user_id, Map.drop(invite, [:timeout_ref])}
+            end)
+            |> Map.new()
+          end)
+          |> :erlang.term_to_binary()
+
+        KvStore.put("party", data.id, to_save)
+
+      true ->
+        nil
+    end
+  end
+
+  def terminate(_reason, _state, %PT.Data{} = _data), do: nil
+
+  defp process_events(%PT.Data{} = data, events) do
+    new_aggregate = compute_aggregate(data, events)
+
+    Enum.each(new_aggregate.side_effects, fn effect ->
+      process_side_effect(new_aggregate.data, effect)
+    end)
+
+    new_aggregate
+  end
+
+  defp compute_aggregate(%PT.Data{} = data, events) do
+    aggregate = %PT.Aggregate{data: data}
+    final_aggregate = Enum.reduce(events, aggregate, &Event.apply_event/2)
+
+    if aggregate.data == final_aggregate.data do
+      final_aggregate
+    else
+      final_aggregate = update_in(final_aggregate.data.version, &(&1 + 1))
+
+      if map_size(final_aggregate.data.members) == 0 do
+        update_in(final_aggregate.actions, &(&1 ++ [{:next_event, :internal, :empty}]))
+      else
+        final_aggregate
+      end
+    end
+  end
+
+  defp process_side_effect(%PT.Data{} = data, :notify_updated) do
+    overview = overview_from_data(data)
+
+    Map.keys(data.invited)
+    |> Enum.concat(Map.keys(data.members))
+    |> Enum.each(fn id ->
+      Player.party_notify_updated(id, overview)
+    end)
+  end
+
+  defp notify_updated(data) do
+    for id <- Map.keys(data.invited) |> Stream.concat(Map.keys(data.members)) do
+      Player.party_notify_updated(id, overview_from_data(data))
+    end
+
+    data
+  end
+
+  defp via_tuple(party_id) do
+    Party.Registry.via_tuple(party_id)
+  end
+
+  defp overview_from_data(%PT.Data{} = data) do
+    %PT.Overview{
+      version: data.version,
+      id: data.id,
+      pid: self(),
+      members: data.members,
+      invited: data.invited,
+      max_members: data.max_members
+    }
+  end
+
+  defp bump(data), do: Map.update!(data, :version, &(&1 + 1))
+
+  defp add_member(%PT.Data{} = data, user_id, user_pid) do
+    data =
+      Map.update!(
+        data,
+        :members,
+        &Map.put(&1, user_id, %{id: user_id, joined_at: DateTime.utc_now()})
+      )
+
+    case MC.get_ref(data.monitors, {:invite, user_id}) do
+      nil ->
+        Map.update!(data, :monitors, fn mc ->
+          MC.monitor(mc, user_pid, {:member, user_id})
+        end)
+
+      _ref ->
+        Map.update!(data, :monitors, fn mc ->
+          MC.replace_val!(mc, {:invite, user_id}, {:member, user_id})
+        end)
+    end
+  end
+
+  defp cancel_invite_internal(invite, data) do
+    :timer.cancel(invite.timeout_ref)
+
+    data =
+      data
+      |> bump()
+      |> Map.update!(:invited, &Map.delete(&1, invite.id))
+      |> Map.update!(:monitors, &MC.demonitor_by_val(&1, {:invite, invite.id}))
+
+    Player.party_notify_removed(invite.id, overview_from_data(data))
+    notify_updated(data)
+    data
+  end
+end

@@ -1,0 +1,57 @@
+defmodule Teiserver.General.CacheClusterServer do
+  @moduledoc """
+  This allows us to propagate data between nodes in the cluster to ensure the ETS
+  tables are kept in sync.
+  """
+
+  alias Phoenix.PubSub
+  use GenServer
+
+  @spec start_link(list) :: :ignore | {:error, any} | {:ok, pid}
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, nil, opts)
+  end
+
+  @impl GenServer
+  def handle_info({:cluster_hooks, :insert_new, from_node, table, key, value}, state) do
+    if from_node != Node.self() do
+      ConCache.insert_new(table, key, value)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:cluster_hooks, :delete, from_node, table, keys}, state) do
+    if from_node != Node.self() do
+      keys
+      |> Enum.each(fn key ->
+        ConCache.delete(table, key)
+      end)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:cluster_hooks, :put, from_node, table, key, value}, state) do
+    if from_node != Node.self() do
+      ConCache.put(table, key, value)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:cluster_hooks, :update, from_node, table, key, func}, state) do
+    if from_node != Node.self() do
+      ConCache.update(table, key, func)
+    end
+
+    {:noreply, state}
+  end
+
+  @impl GenServer
+  @spec init(any) :: {:ok, %{}}
+  def init(_opts) do
+    :ok = PubSub.subscribe(Teiserver.PubSub, "cluster_hooks")
+    {:ok, %{}}
+  end
+end

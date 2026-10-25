@@ -1,0 +1,102 @@
+defmodule Teiserver.Battle.StartScriptTest do
+  alias Teiserver.Autohost.Types, as: AT
+  alias Teiserver.Battle
+  alias Teiserver.Helpers.GeneralTestLib
+
+  use Teiserver.DataCase, async: false
+
+  test "test start script duel" do
+    user1 = GeneralTestLib.make_user(%{"roles" => ["Verified"]})
+    user2 = GeneralTestLib.make_user(%{"roles" => ["Verified"]})
+
+    start_script = %AT.StartScript{
+      game_name: "Beyond All Reason test-28379-33ba377",
+      ally_teams: [
+        %{
+          teams: [
+            %{
+              players: [
+                %AT.Player{
+                  name: user1.name,
+                  user_id: user1.id,
+                  password: "AAAAAAA"
+                }
+              ]
+            }
+          ],
+          startBox: %{left: 0, right: 0.25, top: 0, bottom: 1}
+        },
+        %{
+          teams: [
+            %{
+              players: [
+                %AT.Player{
+                  name: user2.name,
+                  user_id: user2.id,
+                  password: "BBBBBBB"
+                }
+              ]
+            }
+          ],
+          startBox: %{left: 0.75, right: 1, top: 0, bottom: 1}
+        }
+      ],
+      map_name: "BarR 1.1",
+      engine_version: "2025.04.04",
+      spectators: [],
+      start_pos_type: :ingame
+    }
+
+    {:ok, match} = Battle.create_match_from_start_script(start_script, false)
+    match_id = match.id
+    user1_id = user1.id
+    user2_id = user2.id
+
+    assert %{user_id: ^user1_id, match_id: ^match_id} =
+             Battle.get_match_membership(user1.id, match.id)
+
+    assert %{user_id: ^user2_id, match_id: ^match_id} =
+             Battle.get_match_membership(user2.id, match.id)
+  end
+
+  test "test start script 1 vs bot" do
+    user1 = GeneralTestLib.make_user(%{"roles" => ["Verified"]})
+
+    start_script = %AT.StartScript{
+      game_name: "Beyond All Reason test-28379-33ba377",
+      ally_teams: [
+        %{
+          teams: [
+            %{
+              players: [
+                %AT.Player{
+                  name: user1.name,
+                  user_id: user1.id,
+                  password: "AAAAAAA"
+                }
+              ]
+            }
+          ],
+          startBox: %{left: 0, right: 0.25, top: 0, bottom: 1}
+        },
+        %{
+          teams: [
+            %{bots: [%{name: "BARbarIAn", host_user_id: user1.id, ai_short_name: "BARb"}]}
+          ],
+          startBox: %{left: 0.75, right: 1, top: 0, bottom: 1}
+        }
+      ],
+      map_name: "BarR 1.1",
+      engine_version: "2025.04.04",
+      spectators: [],
+      start_pos_type: :ingame
+    }
+
+    {:ok, match} = Battle.create_match_from_start_script(start_script, false)
+    user_id = user1.id
+    match_id = match.id
+
+    assert %{user_id: ^user_id, match_id: ^match_id} =
+             Battle.get_match_membership(user1.id, match.id)
+  end
+end

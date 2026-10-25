@@ -1,0 +1,84 @@
+defmodule Teiserver.Account.UserStatLib do
+  @moduledoc false
+  alias Teiserver.Account.UserStat
+  use TeiserverWeb, :library
+
+  # Queries
+  @spec query_user_stats() :: Ecto.Query.t()
+  def query_user_stats do
+    from(user_stats in UserStat)
+  end
+
+  @spec search(Ecto.Query.t(), map() | nil) :: Ecto.Query.t()
+  def search(query, nil), do: query
+
+  def search(query, params) do
+    params
+    |> Enum.reduce(query, fn {key, value}, query_acc ->
+      _search(query_acc, key, value)
+    end)
+  end
+
+  def _search(query, _key, ""), do: query
+  def _search(query, _key, nil), do: query
+
+  def _search(query, :user_id, id) do
+    from user_stats in query,
+      where: user_stats.user_id == ^id
+  end
+
+  def _search(query, :id_list, id_list) do
+    from user_stats in query,
+      where: user_stats.user_id in ^id_list
+  end
+
+  def _search(query, :data_equal, {"", _value}), do: query
+  def _search(query, :data_equal, {_field, ""}), do: query
+
+  def _search(query, :data_equal, {field, value}) do
+    from user_stats in query,
+      where: fragment("? ->> ? = ?", user_stats.data, ^field, ^value)
+  end
+
+  def _search(query, :data_greater_than, {field, value}) do
+    from user_stats in query,
+      where: fragment("? ->> ? > ?", user_stats.data, ^field, ^value)
+  end
+
+  def _search(query, :data_less_than, {field, value}) do
+    from user_stats in query,
+      where: fragment("? ->> ? < ?", user_stats.data, ^field, ^value)
+  end
+
+  def _search(query, :data_contains, {"", _value}), do: query
+  def _search(query, :data_contains, {_field, ""}), do: query
+
+  def _search(query, :data_contains, {field, value}) do
+    from user_stats in query,
+      where: fragment("? -> ? @> ?", user_stats.data, ^field, ^value)
+  end
+
+  def _search(query, :data_contains_key, field) do
+    from user_stats in query,
+      where: fragment("? @> ?", user_stats.data, ^field)
+  end
+
+  def _search(query, :data_string_contains, {field, value}) do
+    from user_stats in query,
+      where: like(fragment("(? ->> ?)::text", user_stats.data, ^field), ^("%" <> value <> "%"))
+  end
+
+  def _search(query, :data_string_starts_with, {field, value}) do
+    from user_stats in query,
+      where: like(fragment("(? ->> ?)::text", user_stats.data, ^field), ^(value <> "%"))
+  end
+
+  def field_contains(stats, _field, nil), do: stats
+  def field_contains(stats, _field, ""), do: stats
+
+  def field_contains(stats, field, value) do
+    stats
+    |> Stream.filter(fn %{data: data} -> data[field] != nil end)
+    |> Stream.filter(fn %{data: data} -> data[field] |> String.contains?(value) end)
+  end
+end

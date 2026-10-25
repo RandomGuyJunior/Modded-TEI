@@ -1,0 +1,90 @@
+defmodule TeiserverWeb.Tachyon.BattleTest do
+  alias Teiserver.Autohost
+  alias Teiserver.BotFixtures
+  alias Teiserver.Helpers.GeneralTestLib
+  alias Teiserver.OAuthFixtures
+  alias Teiserver.Support.Polling
+  alias Teiserver.Support.Tachyon
+  alias Teiserver.TachyonBattle.Battle
+  use TeiserverWeb.ConnCase
+
+  defp setup_app(_context) do
+    owner = GeneralTestLib.make_user(%{"roles" => ["Verified"]})
+
+    app =
+      OAuthFixtures.app_attrs(owner.id)
+      |> Map.put(:uid, UUID.uuid4())
+      |> OAuthFixtures.create_app()
+
+    {:ok, app: app}
+  end
+
+  setup [:setup_app, {Tachyon, :setup_autohost}]
+
+  # this test is a bit meh because it uses a fairly high level API (the tachyon ws protocol)
+  # but tests some internals of the Battle process
+  # Not sure about a better way though
+  test "battle timeout", %{autohost: autohost, autohost_client: autohost_client} do
+    Polling.poll_until_some(&Autohost.find_autohost/0)
+
+    Task.async(fn ->
+      %{"commandId" => "autohost/start"} = start_req = Tachyon.recv_message!(autohost_client)
+
+      Tachyon.send_response(autohost_client, start_req, %{
+        data: %{"ips" => ["1.2.3.4"], "port" => 12345}
+      })
+    end)
+
+    assert {:ok, pid} =
+             Battle.start(%{
+               battle_id: "whatever",
+               match_id: 123,
+               autohost_id: autohost.id,
+               autohost_timeout: 1,
+               start_script: BotFixtures.start_script()
+             })
+
+    Tachyon.disconnect!(autohost_client)
+    Polling.poll_until(&Autohost.find_autohost/0, &is_nil/1)
+    Polling.poll_until(fn -> Process.alive?(pid) end, &(&1 == false))
+  end
+
+  test "stop battle", %{autohost: autohost, autohost_client: autohost_client} do
+    Polling.poll_until_some(&Autohost.find_autohost/0)
+    battle_id = "whatever"
+    start_script = BotFixtures.start_script()
+
+    Task.async(fn ->
+      %{"commandId" => "autohost/start"} = start_req = Tachyon.recv_message!(autohost_client)
+
+      Tachyon.send_response(autohost_client, start_req, %{
+        data: %{"ips" => ["1.2.3.4"], "port" => 12345}
+      })
+    end)
+
+    assert {:ok, _pid} =
+             Battle.start(%{
+               battle_id: battle_id,
+               match_id: 123,
+               autohost_id: autohost.id,
+               autohost_timeout: 1,
+               start_script: start_script
+             })
+
+    ev = %{
+      battleId: battle_id,
+      time: 1_705_432_698_000_000,
+      update: %{
+        type: "player_chat",
+        userId: "123",
+        message: "!stop",
+        destination: "all"
+      }
+    }
+
+    Tachyon.autohost_send_update_event(autohost_client, ev)
+
+    assert %{"commandId" => "autohost/kill", "data" => %{"battleId" => ^battle_id}} =
+             Tachyon.recv_message!(autohost_client)
+  end
+end

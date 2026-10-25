@@ -1,0 +1,100 @@
+defmodule Teiserver.Logging.LoggingPlug do
+  @moduledoc false
+  alias Plug.Conn
+  alias Teiserver.Logging.PageViewLog
+  alias Teiserver.Repo
+
+  @behaviour Plug
+
+  @spec init(any) :: %{}
+  def init(_opts) do
+    %{}
+  end
+
+  @spec call(Plug.Conn.t(), list()) :: Plug.Conn.t()
+  def call(conn, _ops) do
+    start_tick = :erlang.monotonic_time(:microsecond)
+
+    ip = get_ip_from_conn(conn) || "Error finding IP"
+
+    Conn.register_before_send(conn, fn conn ->
+      if conn.status == 500 do
+        # log_error(conn)
+      else
+        log_view(conn, start_tick, ip |> Tuple.to_list() |> Enum.join("."))
+      end
+
+      conn
+    end)
+  end
+
+  @spec convert_from_x_real_ip(String.t()) :: tuple()
+  defp convert_from_x_real_ip(ip) do
+    if String.contains?(ip, ":") do
+      ip
+      |> String.split(":")
+      |> List.to_tuple()
+    else
+      ip
+      |> String.split(".")
+      |> Enum.map(&String.to_integer/1)
+      |> List.to_tuple()
+    end
+  end
+
+  @spec get_user_id(Plug.Conn.t()) :: nil | integer()
+  defp get_user_id(conn) do
+    if conn.assigns[:current_user] == nil do
+      nil
+    else
+      conn.assigns[:current_user].id
+    end
+  end
+
+  defp log_view(conn, start_tick, ip) do
+    user_id = get_user_id(conn)
+
+    route_info =
+      Phoenix.Router.route_info(TeiserverWeb.Router, conn.method, conn.request_path, conn.host)
+
+    [_empty, section | _rest] = String.split(conn.request_path, "/")
+
+    load_time = :erlang.monotonic_time(:microsecond) - start_tick
+
+    page_log =
+      PageViewLog.changeset(%PageViewLog{}, %{
+        section: section,
+        # don't log the actual path with the params in them as this
+        # is going to generate a lot of noise and catch garbage
+        path: route_info.route,
+        method: conn.method,
+        ip: ip,
+        load_time: load_time,
+        user_id: user_id,
+        status: conn.status
+      })
+
+    if conn.assigns[:do_not_log] == nil do
+      Repo.insert!(page_log)
+    end
+  end
+
+  @doc """
+  Return the IP used by the Conn struct
+  """
+  def get_ip_from_conn(conn) do
+    case List.keyfind(conn.req_headers, "x-real-ip", 0) do
+      {_key, ip} ->
+        convert_from_x_real_ip(ip)
+
+      nil ->
+        case conn do
+          %{remote_ip: ip} -> ip
+          _other -> nil
+        end
+
+      _other ->
+        nil
+    end
+  end
+end

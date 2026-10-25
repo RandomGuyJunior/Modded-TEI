@@ -1,0 +1,42 @@
+defmodule Teiserver.Admin.HourlyCleanupTask do
+  @moduledoc false
+
+  alias Ecto.Adapters.SQL
+  alias Teiserver.Repo
+
+  use Oban.Worker, queue: :cleanup
+
+  @impl Oban.Worker
+  @spec perform(any) :: :ok
+  def perform(_job) do
+    SQL.query!(Repo, "DELETE FROM account_codes WHERE expires < $1", [DateTime.utc_now()])
+
+    chat_log_cleanup()
+
+    :ok
+  end
+
+  defp chat_log_cleanup do
+    days = Application.get_env(:teiserver, Teiserver)[:retention][:room_chat]
+
+    before_timestamp = DateTime.shift(DateTime.utc_now(), day: -days)
+
+    query = """
+          DELETE FROM teiserver_room_messages
+          WHERE inserted_at < $1
+    """
+
+    SQL.query!(Repo, query, [before_timestamp])
+
+    days = Application.get_env(:teiserver, Teiserver)[:retention][:lobby_chat]
+
+    before_timestamp = DateTime.shift(DateTime.utc_now(), day: -days)
+
+    query = """
+          DELETE FROM teiserver_lobby_messages
+          WHERE inserted_at < $1
+    """
+
+    SQL.query!(Repo, query, [before_timestamp])
+  end
+end

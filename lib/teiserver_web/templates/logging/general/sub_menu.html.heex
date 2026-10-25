@@ -1,0 +1,85 @@
+<% {fg, _bg, _bsname} = colours(view_colour(@active)) %>
+
+<style>
+  .sub-menu-icon a:hover {
+    border-bottom: 5px solid <%= fg %>;
+    color: <%= fg %>;
+  }
+
+  .sub-menu-icon .active {
+    border-bottom-color: <%= fg %>;
+  }
+
+  .sub-menu .active, .sub-menu .active:hover {
+    color: <%= fg %>;
+  }
+</style>
+
+<div class="row sub-menu">
+  <div class="col-md-12">
+    <div class="card card-default">
+      <div class="card-body" style="padding: 0 15px;">
+        <div class="row">
+          <%= if allow?(@current_user, "Admin") do %>
+            <.sub_menu_button
+              icon={Teiserver.Logging.ServerDayLogLib.icon()}
+              active={@active == "server"}
+              url={~p"/logging/server"}
+            >
+              Server
+            </.sub_menu_button>
+          <% end %>
+
+          <%= if allow?(@current_user, "Admin") do %>
+            <.sub_menu_button
+              icon={Teiserver.Battle.MatchLib.icon()}
+              active={@active == "match"}
+              url={~p"/logging/match/day_metrics"}
+            >
+              Match
+            </.sub_menu_button>
+          <% end %>
+
+          <%= if allow?(@current_user, "Server") do %>
+            <.sub_menu_button
+              active={@active == "page_view"}
+              url={~p"/logging/page_views"}
+              icon={Teiserver.Logging.PageViewLogLib.icon()}
+            >
+              Web
+            </.sub_menu_button>
+          <% end %>
+
+          <%= if allow?(@current_user, "Server") do %>
+            <.sub_menu_button
+              active={@active == "aggregate"}
+              url={~p"/logging/aggregate_views"}
+              icon={Teiserver.Logging.AggregateViewLogLib.icon()}
+            >
+              Aggregate web
+            </.sub_menu_button>
+          <% end %>
+
+          <%= if allow?(@current_user, "Server") do %>
+            <.sub_menu_button
+              active={@active == "audit"}
+              url={~p"/logging/audit"}
+              icon={Teiserver.Logging.AuditLogLib.icon()}
+            >
+              Audit
+            </.sub_menu_button>
+          <% end %>
+
+          <%= if allow?(@current_user, "Server") do %>
+            <.sub_menu_button
+              url={~p"/logging/live/dashboard"}
+              icon="fa-solid fa-tachograph-digital"
+            >
+              Live dashboard
+            </.sub_menu_button>
+          <% end %>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

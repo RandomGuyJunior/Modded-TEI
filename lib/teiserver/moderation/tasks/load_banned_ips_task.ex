@@ -1,0 +1,30 @@
+defmodule Teiserver.Moderation.LoadBannedIPsTask do
+  @moduledoc """
+  Loads the list of banned IPs from the database into the cache.
+  """
+  alias IP.Subnet
+  alias Teiserver.Helpers.CacheHelper
+  alias Teiserver.Moderation
+  alias Teiserver.Moderation.BannedIP
+
+  def perform do
+    banned_ip_ranges =
+      Moderation.list_banned_ips()
+      |> Enum.map(fn %BannedIP{cidr: cidr} -> Subnet.from_string(cidr) end)
+      |> Enum.filter(fn {status, _value} -> status == :ok end)
+      |> Enum.map(fn {_status, value} -> value end)
+
+    CacheHelper.store_put(
+      :application_metadata_cache,
+      "banned_ip_ranges",
+      MapSet.new(banned_ip_ranges)
+    )
+  end
+
+  def cache_if_ok({:ok, struct}) do
+    perform()
+    {:ok, struct}
+  end
+
+  def cache_if_ok(result), do: result
+end

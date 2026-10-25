@@ -1,0 +1,544 @@
+defmodule Mix.Tasks.Teiserver.Fakedata do
+  @moduledoc """
+  Run with mix teiserver.fakedata
+  """
+
+  @shortdoc "generate seeding data for local dev"
+
+  alias Ecto.Multi
+  alias Teiserver.Account
+  alias Teiserver.Account.User
+  alias Teiserver.Battle
+  alias Teiserver.Battle.MatchLib
+  alias Teiserver.Battle.MatchMembership
+  alias Teiserver.Config
+  alias Teiserver.Game.MatchRatingLib
+  alias Teiserver.Helper.DateHelper
+  alias Teiserver.Helper.StylingHelper
+  alias Teiserver.Logging.ServerMinuteLog
+  alias Teiserver.Logging.Tasks.PersistMatchDayTask
+  alias Teiserver.Logging.Tasks.PersistMatchMonthTask
+  alias Teiserver.Logging.Tasks.PersistServerDayTask
+  alias Teiserver.Logging.Tasks.PersistServerMonthTask
+  alias Teiserver.Moderation.Report
+  alias Teiserver.Repo
+
+  use Mix.Task
+
+  @settings %{
+    # days: 365,
+    days: 5,
+    memory: 1024 * 1024 * 1024,
+    maps: ["Koom valley", "Comet catcher", "Tabula"]
+  }
+
+  @latest_season 2
+
+  defp matches_per_day, do: :rand.uniform(5) + 2
+  defp users_per_day, do: :rand.uniform(5) + 2
+
+  @spec run(list()) :: :ok
+  def run(_args) do
+    # Start by rebuilding the database
+    Mix.Task.run("ecto.reset")
+
+    # Accounts
+    make_accounts()
+    make_spads_accounts()
+
+    make_matches()
+    set_active_season(@latest_season)
+    make_matches()
+    make_telemetry()
+    make_moderation()
+    make_one_time_code()
+
+    # Add fake playtime data to all our non-bot users
+    Mix.Task.run("teiserver.fake_playtime")
+
+    :timer.sleep(50)
+
+    IO.puts(
+      "\nFake data insertion complete. You can now login with the email 'root@localhost' and password 'password'\nA one-time link has been created: http://localhost:4000/one_time_login/fakedata_code\n"
+    )
+  end
+
+  defp add_root_user do
+    {:ok, user} =
+      Account.create_user(%{
+        name: "root",
+        email: "root@localhost",
+        password: Account.spring_md5_password("password"),
+        roles: ["Server", "Verified"],
+        permissions: ["Server"],
+        icon: "fa-solid fa-power-off",
+        colour: "#00AA00",
+        data: %{
+          lobby_client: "FakeData"
+        }
+      })
+
+    user
+  end
+
+  @doc """
+  Uses :application_metadata_cache store to generate a random username
+  based on the keys random_names_1, random_names_2 and random_names_3
+  if you override these keys with an empty list you can generate shorter names
+  """
+  @spec generate_throwaway_name() :: String.t()
+  def generate_throwaway_name do
+    names1 =
+      ~w(serene energised humble auspicious decisive exemplary cheerful
+        determined playful spry springy)
+
+    names2 =
+      ~w(maroon cherry rose ruby amber carrot lemon beige mint lime cadmium
+        aqua cerulean lavender indigo magenta amethyst)
+
+    names3 =
+      ~w(tick pawn lazarus rocketeer crossbow mace centurion tumbleweed smuggler compass
+        ghost sprinter butler webber platypus hound welder recluse archangel
+        gunslinger sharpshooter umbrella fatboy
+        marauder vanguard razorback titan
+        grunt graverobber aggravator trasher thug bedbug
+        deceiver augur spectre fiend twitcher duck skuttle sumo arbiter manticore
+        termite commando mammoth shiva karganeth catapult behemoth juggernaught
+      )
+
+    [names1, names2, names3]
+    |> Enum.map_join("", fn l -> Enum.random(l) |> String.capitalize() end)
+  end
+
+  defp make_accounts do
+    root_user = add_root_user()
+
+    new_users =
+      Range.new(0, @settings.days)
+      |> ParallelStream.map(fn day ->
+        Range.new(0, users_per_day())
+        |> ParallelStream.map(fn _index ->
+          minutes = :rand.uniform(24 * 60)
+          name = generate_throwaway_name()
+
+          %{
+            name: name,
+            email: "#{name}@example.com",
+            password: root_user.password,
+            permissions: [],
+            icon: "fa-solid #{StylingHelper.random_icon()}",
+            colour: StylingHelper.random_colour(),
+            roles: ["Verified"],
+            data: %{
+              lobby_client: "FakeData",
+              bot: false
+            },
+            inserted_at:
+              DateTime.utc_now()
+              |> DateTime.shift(day: -day)
+              |> DateTime.shift(minute: -minutes)
+              |> time_convert(),
+            updated_at:
+              DateTime.utc_now()
+              |> DateTime.shift(day: -day)
+              |> DateTime.shift(minute: -minutes)
+              |> time_convert()
+          }
+        end)
+        |> Enum.to_list()
+      end)
+      |> Enum.to_list()
+      |> List.flatten()
+
+    Multi.new()
+    |> Multi.insert_all(:insert_all, User, new_users)
+    |> Repo.transaction()
+  end
+
+  def make_spads_accounts do
+    # this isn't terribly efficient but it's only a few records for a one-off
+    # These are bots that can be used directly with
+    # https://github.com/beyond-all-reason/ansible-spads-setup out of the
+    # box, no need to run the registration step in the playbook
+    ansible_data =
+      Enum.map(1..3, fn i ->
+        name = "clusterTEST#{i}"
+        email = "test#{i}@spads.local"
+        password = "clustertest#{i}pass"
+        {name, email, password}
+      end)
+
+    # and a few other spads account with the same hardcoded password
+    other_data =
+      Enum.map(1..3, fn i ->
+        name = "spadsTEST#{i}"
+        email = "localtest#{i}@spads.local"
+        password = "password"
+        {name, email, password}
+      end)
+
+    Enum.concat(ansible_data, other_data)
+    |> Enum.each(fn {name, email, password} ->
+      Account.create_user(%{
+        name: name,
+        email: email,
+        password: Account.spring_md5_password(password),
+        roles: ["Verified", "Bot", "Moderator"],
+        permissions: ["Verified", "Bot", "Moderator"],
+        icon: "fa-solid fa-robot",
+        colour: "royalblue",
+        data: %{
+          lobby_client: "FakeSpads"
+        }
+      })
+    end)
+  end
+
+  defp make_telemetry do
+    # First we need to make by the minute telemetry data
+    Range.new(0, @settings.days)
+    |> Enum.each(fn day ->
+      date = Date.add(Date.utc_today(), -day)
+
+      user_ids =
+        Account.list_users(
+          search: [
+            inserted_after: DateHelper.to_datetime(date),
+            not_has_role: "Bot"
+          ],
+          select: [:id]
+        )
+        |> Enum.map(fn %{id: id} -> id end)
+
+      user_count = Enum.count(user_ids)
+
+      lobby_count =
+        user_count
+        |> Kernel.div(6)
+        |> round()
+        |> max(1)
+
+      logs =
+        Range.new(1, 1440)
+        |> Enum.map(fn m ->
+          {menu, lobby, player, spectator} = {
+            random_pick_from(user_ids, 0.2),
+            random_pick_from(user_ids, 0.2),
+            random_pick_from(user_ids, 0.2),
+            random_pick_from(user_ids, 0.2)
+          }
+
+          total = [menu, lobby, player, spectator] |> List.flatten()
+
+          timestamp =
+            DateHelper.to_datetime(date)
+            |> DateTime.shift(minute: m)
+            |> DateTime.to_unix()
+            |> DateTime.from_unix!()
+
+          %{
+            timestamp: timestamp,
+            data: %{
+              battle: %{
+                lobby: :rand.uniform(lobby_count),
+                total: :rand.uniform(lobby_count) * 4,
+                started: :rand.uniform(lobby_count),
+                stopped: :rand.uniform(lobby_count),
+                in_progress: :rand.uniform(lobby_count)
+              },
+              client: %{
+                menu: random_pick_from(user_ids),
+                lobby: random_pick_from(user_ids),
+                player: random_pick_from(user_ids),
+                spectator: random_pick_from(user_ids),
+                total: total
+              },
+              os_mon: %{
+                cpu_avg1: :rand.uniform(50) + 50,
+                cpu_avg5: :rand.uniform(50) + 50,
+                cpu_avg15: :rand.uniform(50) + 50,
+                cpu_nprocs: :rand.uniform(50) + 50,
+                system_mem: %{
+                  free_swap: :rand.uniform(10) * @settings.memory,
+                  total_swap: :rand.uniform(10) * @settings.memory,
+                  free_memory: :rand.uniform(10) * @settings.memory,
+                  total_memory: :rand.uniform(10) * @settings.memory,
+                  cached_memory: :rand.uniform(10) * @settings.memory,
+                  buffered_memory: :rand.uniform(10) * @settings.memory,
+                  available_memory: :rand.uniform(10) * @settings.memory,
+                  system_total_memory: 4 * @settings.memory
+                }
+              },
+              server: %{
+                bots_connected: :rand.uniform(lobby_count),
+                users_connected: :rand.uniform(lobby_count) * 2,
+                bots_disconnected: :rand.uniform(lobby_count),
+                users_disconnected: :rand.uniform(lobby_count) * 2
+              },
+              matchmaking: %{}
+            }
+          }
+        end)
+
+      Multi.new()
+      |> Multi.insert_all(:insert_all, ServerMinuteLog, logs)
+      |> Repo.transaction()
+    end)
+
+    # Now persist day values
+    Range.new(0, @settings.days)
+    |> Enum.each(fn _day ->
+      PersistServerDayTask.perform(%{})
+      PersistMatchDayTask.perform(%{})
+    end)
+
+    # And monthly
+    months = (@settings.days / 31) |> :math.ceil() |> round()
+
+    Range.new(0, months)
+    |> Enum.each(fn _day ->
+      PersistServerMonthTask.perform(%{})
+      PersistMatchMonthTask.perform(%{})
+    end)
+  end
+
+  defp make_moderation do
+    Range.new(0, @settings.days)
+    |> Enum.each(fn day ->
+      date = Date.add(Date.utc_today(), -day)
+
+      users =
+        Account.list_users(
+          search: [
+            inserted_after: DateHelper.to_datetime(date),
+            not_has_role: "Bot"
+          ],
+          select: [:id, :name]
+        )
+        |> Enum.map(fn %{id: id, name: name} -> {id, name} end)
+
+      report_count = (Enum.count(users) / 7) |> round()
+
+      basic_reports =
+        Range.new(0, report_count)
+        |> Enum.map(fn _index ->
+          if Enum.count(users) > 1 do
+            [{reporter_id, _name1}, {target_id, _name2} | _rest] =
+              Enum.shuffle(users) |> Enum.take(2)
+
+            report_time =
+              DateHelper.to_datetime(date)
+              |> DateTime.shift(minute: 10 + :rand.uniform(1000))
+              |> time_convert()
+
+            %{
+              reporter_id: reporter_id,
+              target_id: target_id,
+              type: "Chat",
+              sub_type: Enum.random(~w(any spam bullying abusive)),
+              inserted_at: report_time,
+              updated_at: report_time
+            }
+          end
+        end)
+        |> Enum.reject(&(&1 == nil))
+
+      match_reports =
+        Battle.list_matches(
+          search: [
+            started_after: DateHelper.to_datetime(date),
+            started_before: DateTime.shift(DateHelper.to_datetime(date), day: 1)
+          ],
+          preload: [:members]
+        )
+        |> Enum.shuffle()
+        |> Enum.take(report_count)
+        |> Enum.map(fn match ->
+          [reporter, target | _rest] = Enum.shuffle(match.members) |> Enum.take(2)
+          report_time = DateTime.shift(match.started, minute: 20) |> time_convert()
+
+          relationship =
+            cond do
+              reporter.team_id == target.team_id -> "Ally"
+              reporter.team_id != target.team_id -> "Opponent"
+            end
+
+          %{
+            reporter_id: reporter.user_id,
+            target_id: target.user_id,
+            type: "Game",
+            sub_type: Enum.random(~w(any noob griefing cheating)),
+            relationship: relationship,
+            match_id: match.id,
+            inserted_at: report_time,
+            updated_at: report_time
+          }
+        end)
+
+      Multi.new()
+      |> Multi.insert_all(:insert_all, Report, basic_reports ++ match_reports)
+      |> Repo.transaction()
+    end)
+  end
+
+  defp make_matches do
+    match_ids =
+      Range.new(0, @settings.days)
+      |> Enum.flat_map(fn day ->
+        date =
+          Date.utc_today()
+          |> Date.add(-day)
+          |> Date.shift(year: -(@latest_season - MatchRatingLib.active_season()))
+
+        users =
+          Account.list_users(
+            search: [
+              inserted_after: DateHelper.to_datetime(date),
+              not_has_role: "Bot"
+            ],
+            select: [:id, :name]
+          )
+          |> Enum.map(fn %{id: id, name: name} -> {id, name} end)
+
+        server_uuid = UUID.uuid1()
+
+        Range.new(0, matches_per_day())
+        |> Enum.map(fn _index ->
+          max_size = Enum.count(users) |> Kernel.div(2) |> :math.floor() |> round()
+          team_size = min(:rand.uniform(8), max_size)
+          shuffled_users = Enum.shuffle(users)
+          team1 = shuffled_users |> Enum.take(team_size)
+          team2 = shuffled_users |> Enum.reverse() |> Enum.take(team_size)
+          team_count = 2
+          num_players = team_size * team_count
+          game_type = MatchLib.game_type(team_size, team_count)
+
+          team1_score =
+            team1
+            |> Enum.map(fn {_userid, name} -> String.length(name) end)
+            |> Enum.sum()
+
+          team2_score =
+            team2
+            |> Enum.map(fn {_userid, name} -> String.length(name) end)
+            |> Enum.sum()
+
+          start_time =
+            DateHelper.to_datetime(date) |> DateTime.shift(minute: 10 + :rand.uniform(1000))
+
+          end_time = DateTime.shift(start_time, minute: 10 + :rand.uniform(120))
+
+          {:ok, match} =
+            Battle.create_match(%{
+              server_uuid: server_uuid,
+              uuid: UUID.uuid1(),
+              map: Enum.random(@settings.maps),
+              data: %{},
+              tags: %{},
+              winning_team: if(team1_score > team2_score, do: 0, else: 1),
+              team_count: team_count,
+              team_size: team_size,
+              passworded: false,
+              processed: true,
+              game_type: game_type,
+
+              # All rooms are hosted by the same user for now
+              founder_id: 1,
+              bots: %{},
+              queue_id: nil,
+              started: start_time,
+              finished: end_time
+            })
+
+          memberships1 =
+            team1
+            |> Enum.map(fn {userid, _name} ->
+              %{
+                team_id: 0,
+                win: match.winning_team == 0,
+                party_id: get_party_id(num_players),
+                user_id: userid,
+                match_id: match.id
+              }
+            end)
+
+          memberships2 =
+            team2
+            |> Enum.map(fn {userid, _name} ->
+              %{
+                team_id: 1,
+                win: match.winning_team == 1,
+                party_id: get_party_id(num_players),
+                user_id: userid,
+                match_id: match.id
+              }
+            end)
+
+          Multi.new()
+          |> Multi.insert_all(
+            :insert_all,
+            MatchMembership,
+            memberships1 ++ memberships2
+          )
+          |> Repo.transaction()
+
+          match.id
+        end)
+      end)
+
+    MatchRatingLib.re_rate_specific_matches(match_ids)
+  end
+
+  defp set_active_season(season) do
+    Config.update_site_config("rating.Season", season)
+  end
+
+  defp make_one_time_code do
+    root_user = Account.deprecated_get_user_by_email("root@localhost")
+
+    Config.update_site_config("user.Enable one time links", "true")
+
+    {:ok, _code} =
+      Account.create_code(%{
+        value: "fakedata_code$127.0.0.1",
+        purpose: "one_time_login",
+        expires: DateTime.shift(DateTime.utc_now(), hour: 24),
+        user_id: root_user.id
+      })
+  end
+
+  # This allows us to round off microseconds and convert datetime to naive_datetime
+  defp time_convert(t) do
+    t
+    |> DateTime.to_unix()
+    |> DateTime.from_unix!()
+    |> DateTime.to_naive()
+  end
+
+  defp random_pick_from(list, chance \\ 0.5) do
+    list
+    |> Enum.filter(fn _element ->
+      :rand.uniform() < chance
+    end)
+  end
+
+  # Adds a party id or nil
+  defp get_party_id(num_players) do
+    case in_party?() do
+      true ->
+        num_parties = trunc(num_players / 4)
+        # party id is a string
+        "#{Enum.random(1..num_parties)}"
+
+      false ->
+        nil
+    end
+  end
+
+  defp in_party? do
+    chance_in_party = 40
+    # Number from 0 to 100
+    random = Enum.random(0..100)
+    random <= chance_in_party
+  end
+end

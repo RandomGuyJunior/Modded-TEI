@@ -1,0 +1,136 @@
+<% bsname = view_colour() %>
+
+{render(
+  TeiserverWeb.Report.GeneralView,
+  "sub_menu.html",
+  Map.merge(assigns, %{active: "reports"})
+)}
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <form
+          action={~p"/teiserver/reports/show/new_smurf"}
+          method="post"
+          class="form-horizontal mb-4"
+        >
+          <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+
+          <div class="row">
+            <div class="col-md-4 col-lg-3 col-xl-2 my-2">
+              <label for="report_max_account_age" class="control-label">
+                Max account age (days):
+              </label>
+              <input
+                type="text"
+                name="report[max_account_age]"
+                id="report_max_account_age"
+                value={@params["max_account_age"]}
+                class="form-control"
+              />
+            </div>
+
+            <div class="col-md-4 col-lg-3 col-xl-2 my-2">
+              <label for="report_max_play_age" class="control-label">Max play age (days): </label>
+              <input
+                type="text"
+                name="report[max_play_age]"
+                id="report_max_play_age"
+                value={@params["max_play_age"]}
+                class="form-control"
+              />
+            </div>
+
+            <div class="col-md-4 col-lg-3 col-xl-2 my-2">
+              <label for="report_ignore_banned" class="control-label">Ignore banned</label>
+              <.input
+                type="checkbox"
+                id="report_ignore_banned"
+                name="report[ignore_banned]"
+                checked={@params["ignore_banned"] == "true"}
+                label=""
+                value="true"
+                description="Ignore users already banned"
+              />
+            </div>
+
+            <div class="col-md-4 col-lg-3 col-xl-2 my-2">
+              &nbsp;<br />
+              <input
+                type="submit"
+                value="Update report"
+                name="form.submitted"
+                class={"btn btn-#{bsname} btn-block"}
+              />
+            </div>
+          </div>
+        </form>
+
+        <div class="table-responsive">
+          <table class="table table-sm table-hover mt-4">
+            <thead>
+              <tr>
+                <th>New user</th>
+                <th>Status</th>
+                <th>Last login</th>
+                <th>Registered</th>
+
+                <th>Duel</th>
+                <th>FFA</th>
+                <th>Team</th>
+
+                <th>&nbsp;</th>
+              </tr>
+            </thead>
+            <tbody>
+              <%= for user <- @relevant_new_users do %>
+                <% stats = @user_stats[user.id] %>
+
+                <tr>
+                  <td>{user.name}</td>
+                  <td>
+                    <TeiserverWeb.UserComponents.status_icon user={user} />
+                  </td>
+
+                  <td>
+                    {date_to_str(user.last_login,
+                      format: :hms_or_ymd,
+                      tz: @tz
+                    )}
+                  </td>
+                  <td>{date_to_str(user.inserted_at, format: :hms_or_ymd, tz: @tz)}</td>
+
+                  <td>
+                    <%= if stats["recent_count.duel"] do %>
+                      {stats["win_rate.duel"]}% of {stats["recent_count.duel"]}
+                    <% end %>
+                  </td>
+                  <td>
+                    <%= if stats["recent_count.ffa"] do %>
+                      {stats["win_rate.ffa"]}% of {stats["recent_count.ffa"]}
+                    <% end %>
+                  </td>
+                  <td>
+                    <%= if stats["recent_count.team"] do %>
+                      {stats["win_rate.team"]}% of {stats["recent_count.team"]}
+                    <% end %>
+                  </td>
+
+                  <td>
+                    <a
+                      href={~p"/teiserver/admin/users/smurf_search/#{user.id}"}
+                      class="btn btn-secondary btn-sm"
+                    >
+                      Show
+                    </a>
+                  </td>
+                </tr>
+              <% end %>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

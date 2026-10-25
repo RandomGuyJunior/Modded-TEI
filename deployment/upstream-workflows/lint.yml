@@ -1,0 +1,82 @@
+name: Lint and style checks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+env:
+  # Ensure we're fetching the right dependencies for continuous integration
+  MIX_ENV: test
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Lint and style checks
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Elixir and Erlang
+      uses: erlef/setup-beam@v1
+      id: setup-beam
+      with:
+        version-type: "strict"
+        version-file: "mise.toml"
+
+    - name: Pin hex to previous version
+      run: mix local.hex 2.4.2 --force
+
+    - name: Cache dependencies
+      id: cache-deps
+      uses: actions/cache@v4
+      env:
+        cache-name: cache-deps-${{ runner.os }}-${{ steps.setup-beam.outputs.otp-version }}-${{ steps.setup-beam.outputs.elixir-version }}-
+      with:
+        path: deps
+        key: ${{ env.cache-name }}${{ hashFiles('**/mix.lock') }}
+        restore-keys: |
+          ${{ env.cache-name }}
+
+    - name: Cache compiled build
+      id: cache-build
+      uses: actions/cache@v4
+      env:
+        cache-name: cache-build-${{ runner.os }}-${{ steps.setup-beam.outputs.otp-version }}-${{ steps.setup-beam.outputs.elixir-version }}-
+      with:
+        path: _build
+        key: ${{ env.cache-name }}${{ hashFiles('**/mix.lock') }}
+        restore-keys: |
+          ${{ env.cache-name }}
+
+    - name: Install dependencies
+      run: mix deps.get
+
+    - name: Find unused dependencies # https://hexdocs.pm/mix/Mix.Tasks.Deps.Unlock.html
+      run: mix deps.unlock --check-unused
+
+    - name: Check for retired dependencies # https://hexdocs.pm/hex/Mix.Tasks.Hex.Audit.html
+      run: mix hex.audit
+
+    # decimal is a transitive dependency to 3 other packages and it's going to be a pain to update
+    # so for the moment, just ignore the error
+    # gun is a transitive dependency used by nostrum and will also be a problem to update but is
+    # only used by Nostrum for discord
+    - name: Check for vulnerable dependencies # https://github.com/mirego/mix_audit
+      run: mix deps.audit --ignore-package-names decimal,gun
+
+    - name: Ensure Elixir code is formatted # https://hexdocs.pm/mix/Mix.Tasks.Format.html
+      run: mix format --check-formatted
+
+    - name: Compile the project
+      run: mix compile --warnings-as-errors
+
+    - name: Lint Elixir code to enforce code consistency # Credo's strict analysis: https://hexdocs.pm/credo/basic_usage.html#strict-analysis
+      run: mix credo --strict

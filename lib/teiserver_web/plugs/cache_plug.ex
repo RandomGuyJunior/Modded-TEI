@@ -1,0 +1,36 @@
+defmodule Teiserver.Plugs.CachePlug do
+  @moduledoc false
+
+  alias Phoenix.LiveView.Utils
+  alias Teiserver.Config
+  import Plug.Conn
+
+  def init(_opts) do
+  end
+
+  def call(%{assigns: %{user_id: nil}} = conn, _opts) do
+    conn
+    |> assign(:tz, Application.get_env(:teiserver, Teiserver.Config)[:defaults].tz)
+  end
+
+  def call(conn, _opts) do
+    conn
+    |> assign(:tz, Config.get_user_config_cache(conn, "general.Timezone"))
+  end
+
+  def live_call(%{assigns: %{current_user: %{id: userid}}} = socket) do
+    socket
+    |> Utils.assign(
+      :tz,
+      Config.get_user_config_cache(userid, "general.Timezone")
+    )
+  end
+
+  def live_call(socket) do
+    socket
+    |> Utils.assign(
+      :tz,
+      Application.get_env(:teiserver, Teiserver.Config)[:defaults].tz
+    )
+  end
+end

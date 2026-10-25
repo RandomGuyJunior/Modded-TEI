@@ -1,0 +1,90 @@
+defmodule Teiserver.Logging.LoggingTestLib do
+  @moduledoc false
+
+  alias Teiserver.AccountFixtures
+  alias Teiserver.Logging
+  alias Teiserver.Logging.AggregateViewLog
+  alias Teiserver.Logging.AggregateViewLogLib
+  alias Teiserver.Logging.AuditLog
+  alias Teiserver.Logging.PageViewLog
+  alias Teiserver.Logging.PageViewLogLib
+
+  use TeiserverWeb, :library
+
+  def new_page_view_log(user, data \\ %{}) do
+    PageViewLog.changeset(%PageViewLog{}, %{
+      section: data["section"] || "section",
+      path: data["path"] || "section/sub/page",
+      method: data["method"] || "400",
+      ip: data["ip"] || "127.0.0.1",
+      load_time: data["load_time"] || 105,
+      user_id: user.id,
+      status: data["status"] || 200
+    })
+    |> Repo.insert!()
+  end
+
+  def fake_audit_log(user) do
+    AuditLog.changeset(%AuditLog{}, %{
+      action: "Fake log",
+      ip: "127.0.0.1",
+      details: %{},
+      user_id: user.id
+    })
+    |> Repo.insert!()
+  end
+
+  def fake_aggregate_log(date) do
+    AggregateViewLog.changeset(%AggregateViewLog{}, %{
+      "date" => date,
+      "total_views" => 103,
+      "total_uniques" => 13,
+      "average_load_time" => 5678,
+      "guest_view_count" => 13,
+      "guest_unique_ip_count" => 4,
+      "percentile_load_time_95" => 12_445,
+      "percentile_load_time_99" => 14_788,
+      "max_load_time" => 19_871,
+      "hourly_views" => 1..24 |> Enum.map(&(&1 * 4)),
+      "hourly_uniques" => 1..24 |> Enum.map(&(&1 * 6)),
+      "hourly_average_load_times" => 1..24 |> Enum.map(&(&1 * 1987)),
+      "user_data" => %{},
+      "section_data" => %{}
+    })
+    |> Repo.insert!()
+  end
+
+  @spec logging_setup(List.t()) :: {:ok, List.t()}
+  @spec logging_setup(List.t(), List.t()) :: {:ok, List.t()}
+  def logging_setup(existing, flags \\ []) do
+    {:ok, existing} = existing
+
+    user = AccountFixtures.user_fixture()
+
+    aggregate_logs =
+      if flags[:aggregate_logs] do
+        AggregateViewLogLib.get_logs()
+        |> AggregateViewLogLib.order("Oldest first")
+        |> Repo.all()
+      end
+
+    page_view_logs =
+      if flags[:page_view_logs] do
+        PageViewLogLib.get_page_view_logs()
+        |> PageViewLogLib.search(user_id: user.id)
+        |> Repo.all()
+      end
+
+    {:ok,
+     existing ++
+       [
+         aggregate_logs: aggregate_logs,
+         page_view_logs: page_view_logs
+       ]}
+  end
+
+  def get_most_recent_audit_log_for_user(user_id) do
+    Logging.list_audit_logs(where: [user_id: user_id], limit: 1, order_by: "Newest first")
+    |> List.first()
+  end
+end

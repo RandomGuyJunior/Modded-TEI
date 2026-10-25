@@ -1,0 +1,143 @@
+{
+    "$id": "https://schema.beyondallreason.dev/tachyon/definitions/privateUser.json",
+    "title": "PrivateUser",
+    "allOf": [
+        { "$ref": "../definitions/user.json" },
+        {
+            "type": "object",
+            "properties": {
+                "party": {
+                    "anyOf": [
+                        { "$ref": "../definitions/partyState.json" },
+                        { "type": "null" }
+                    ]
+                },
+                "invitedToParties": {
+                    "type": "array",
+                    "items": { "$ref": "../definitions/partyState.json" }
+                },
+                "friendIds": {
+                    "type": "array",
+                    "items": { "$ref": "../definitions/userId.json" }
+                },
+                "outgoingFriendRequest": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "to": { "$ref": "../definitions/userId.json" },
+                            "sentAt": { "$ref": "../definitions/unixTime.json" }
+                        },
+                        "required": ["to", "sentAt"]
+                    }
+                },
+                "incomingFriendRequest": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "from": { "$ref": "../definitions/userId.json" },
+                            "sentAt": { "$ref": "../definitions/unixTime.json" }
+                        },
+                        "required": ["from", "sentAt"]
+                    }
+                },
+                "ignoreIds": {
+                    "type": "array",
+                    "items": { "$ref": "../definitions/userId.json" }
+                },
+                "currentBattle": {
+                    "$ref": "../definitions/privateBattle.json"
+                },
+                "currentLobby": {
+                    "anyOf": [
+                        { "$ref": "../definitions/lobbyId.json" },
+                        { "type": "null" }
+                    ]
+                },
+                "clanInvites": {
+                    "type": "array",
+                    "items": { "$ref": "../definitions/clanId.json" }
+                },
+                "matchmaking": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "state": { "const": "no_matchmaking" }
+                            },
+                            "required": ["state"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "state": { "const": "queuing" },
+                                "queues": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": { "type": "string" },
+                                            "version": { "type": "string" }
+                                        },
+                                        "required": ["id", "version"]
+                                    },
+                                    "minItems": 1
+                                }
+                            },
+                            "required": ["state", "queues"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "state": { "const": "found" },
+                                "queue": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": { "type": "string" },
+                                        "version": { "type": "string" },
+                                        "timeoutAt": {
+                                            "$ref": "../definitions/unixTime.json"
+                                        },
+                                        "hasAlreadyReadied": {
+                                            "type": "boolean"
+                                        }
+                                    },
+                                    "required": [
+                                        "id",
+                                        "version",
+                                        "timeoutAt",
+                                        "hasAlreadyReadied"
+                                    ]
+                                },
+                                "otherQueues": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": { "type": "string" },
+                                            "version": { "type": "string" }
+                                        },
+                                        "required": ["id", "version"]
+                                    }
+                                }
+                            },
+                            "required": ["state", "queue", "otherQueues"]
+                        }
+                    ]
+                }
+            },
+            "required": [
+                "party",
+                "invitedToParties",
+                "friendIds",
+                "outgoingFriendRequest",
+                "incomingFriendRequest",
+                "ignoreIds",
+                "currentLobby",
+                "clanInvites",
+                "matchmaking"
+            ]
+        }
+    ]
+}

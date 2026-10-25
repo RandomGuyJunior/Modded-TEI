@@ -1,0 +1,177 @@
+<% bsname = view_colour() %>
+
+{render(
+  TeiserverWeb.Logging.GeneralView,
+  "sub_menu.html",
+  Map.merge(assigns, %{active: "server"})
+)}
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <TeiserverWeb.Components.Logging.ServerViewLogComponents.section_menu
+          active={"#{@unit}_list"}
+          colour={bsname}
+        />
+        <br /><br />
+
+        <.section_menu_button
+          bsname={bsname}
+          icon={StylingHelper.icon(:list)}
+          active={@filter == "default"}
+          url="?filter=default"
+        >
+          Overview
+        </.section_menu_button>
+
+        <%= if @unit == "day" do %>
+          &nbsp;&nbsp;
+          <.section_menu_button
+            active={@filter == "hourly-users"}
+            icon="fa-solid fa-grid-4"
+            bsname={bsname}
+            url="?filter=hourly-users"
+          >
+            Users
+          </.section_menu_button>
+
+          <.section_menu_button
+            active={@filter == "hourly-players"}
+            icon="fa-solid fa-grid-4"
+            bsname={bsname}
+            url="?filter=hourly-players"
+          >
+            Players
+          </.section_menu_button>
+
+          <.section_menu_button
+            active={@filter == "hourly-battles"}
+            icon="fa-solid fa-grid-4"
+            bsname={bsname}
+            url="?filter=hourly-battles"
+          >
+            Battles
+          </.section_menu_button>
+        <% end %>
+        &nbsp;&nbsp;
+        <.section_menu_button
+          active={@filter == "graph-unique-users"}
+          icon={StylingHelper.icon(:chart)}
+          bsname={bsname}
+          url="?filter=graph-unique-users"
+        >
+          Uniques
+        </.section_menu_button>
+
+        <.section_menu_button
+          active={@filter == "graph-peak-users"}
+          icon={StylingHelper.icon(:chart)}
+          bsname={bsname}
+          url="?filter=graph-peak-users"
+        >
+          Peaks
+        </.section_menu_button>
+
+        <.section_menu_button
+          active={@filter == "graph-time"}
+          icon={StylingHelper.icon(:chart)}
+          bsname={bsname}
+          url="?filter=graph-time"
+        >
+          Time
+        </.section_menu_button>
+        &nbsp;&nbsp;
+        <.section_menu_button
+          bsname={bsname}
+          icon={StylingHelper.icon(:chart)}
+          active={@filter == "graph-client-events"}
+          url="?filter=graph-client-events"
+        >
+          >
+          Client
+        </.section_menu_button>
+
+        <.section_menu_button
+          bsname={bsname}
+          icon={StylingHelper.icon(:chart)}
+          active={@filter == "graph-server-events"}
+          url="?filter=graph-server-events"
+        >
+          >
+          Server
+        </.section_menu_button>
+
+        <.section_menu_button
+          bsname={bsname}
+          icon={StylingHelper.icon(:chart)}
+          active={@filter == "graph-lobby-events"}
+          url="?filter=graph-lobby-events"
+        >
+          >
+          Lobby
+        </.section_menu_button>
+
+        <.section_menu_button
+          bsname={bsname}
+          icon={StylingHelper.icon(:chart)}
+          active={@filter == "graph-match-events"}
+          url="?filter=graph-match-events"
+        >
+          >
+          Match
+        </.section_menu_button>
+
+        <.section_menu_button
+          bsname={bsname}
+          icon={StylingHelper.icon(:chart)}
+          active={@filter == "graph-infologs"}
+          url="?filter=graph-infologs"
+        >
+          >
+          Infolog
+        </.section_menu_button>
+
+        <%= if String.starts_with?(@filter, "hourly-") do %>
+          &nbsp;&nbsp;&nbsp;&nbsp;
+          <span class={"btn btn-#{bsname}"} onclick='$(".hourly-view-span").show();'>
+            <i class="fa-fw fa-solid fa-eye"></i> Show numbers
+          </span>
+
+          <span class={"btn btn-#{bsname}"} onclick='$(".hourly-view-span").hide();'>
+            <i class="fa-fw fa-solid fa-eye-slash"></i> Hide numbers
+          </span>
+        <% end %>
+
+        <a
+          href={~p"/logging/match/day_metrics"}
+          class={"btn float-end btn-outline-#{TeiserverWeb.Logging.MatchLogView.view_colour}"}
+        >
+          <Fontawesome.icon icon={TeiserverWeb.Logging.MatchLogView.icon()} style="regular" />
+          &nbsp;
+          Match data
+        </a>
+        <br /><br />
+
+        <%= case @filter do %>
+          <% "hourly-users" -> %>
+            {render(
+              "heatmap_list.html",
+              Map.put(assigns, :path, ~w(average_user_counts total))
+            )}
+          <% "hourly-players" -> %>
+            {render(
+              "heatmap_list.html",
+              Map.put(assigns, :path, ~w(average_user_counts player))
+            )}
+          <% "hourly-battles" -> %>
+            {render("heatmap_list.html", Map.put(assigns, :path, ~w(battles in_progress)))}
+          <% "graph-" <> _ -> %>
+            {render("metric_graph.html", assigns)}
+          <% _ -> %>
+            {render("metric_list_data.html", assigns)}
+        <% end %>
+      </div>
+    </div>
+  </div>
+</div>

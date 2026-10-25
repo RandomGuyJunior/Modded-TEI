@@ -1,0 +1,70 @@
+defmodule TeiserverWeb.Tachyon.SessionTest do
+  alias Teiserver.Player
+  alias Teiserver.Player.SessionRegistry
+  alias Teiserver.Support.Tachyon
+  alias WebsocketSyncClient, as: WSC
+  use TeiserverWeb.ConnCase
+  import Teiserver.Support.Polling, only: [poll_until_some: 1, poll_until: 2]
+
+  setup _context do
+    Tachyon.setup_client()
+  end
+
+  test "session is spawned when player connects", %{user: user} do
+    registered_pid = poll_until_some(fn -> SessionRegistry.lookup(user.id) end)
+    assert is_pid(registered_pid)
+    assert :connected == Player.conn_state(user.id)
+  end
+
+  test "session persist after disconnection", %{user: user, client: client} do
+    conn_pid = poll_until_some(fn -> Player.lookup_connection(user.id) end)
+    assert :connected == Player.conn_state(user.id)
+    Process.monitor(conn_pid)
+    :ok = WSC.disconnect(client)
+    assert_receive({:DOWN, _ref, :process, _pid, {:shutdown, :local_closed}})
+    assert is_pid(SessionRegistry.lookup(user.id))
+    poll_until(fn -> Player.conn_state(user.id) end, &(&1 == :reconnecting))
+  end
+
+  test "player gets kicked out if session dies", %{user: user, client: client} do
+    sess_pid = poll_until_some(fn -> SessionRegistry.lookup(user.id) end)
+    Player.monitor_session(user.id)
+    Process.exit(sess_pid, :please_die)
+    assert_receive({:DOWN, _, :process, _, _})
+
+    # make sure the existing client has been disconnected
+    assert {:error, :disconnected} == WSC.recv(client)
+  end
+
+  test "existing connection is terminated when a new one comes in", %{
+    client: client,
+    token: token
+  } do
+    _client2 = Tachyon.connect(token)
+    WSC.send_message(client, {:text, "test_ping"})
+    assert {:error, :disconnected} == WSC.recv(client)
+  end
+
+  test "connection state for never seen before" do
+    assert :disconnected == Player.conn_state(-123_489)
+  end
+
+  test "session dies after too long", %{client: client, user: user} do
+    Tachyon.abrupt_disconnect!(client)
+    assert {:error, :disconnected} = WSC.send_message(client, {:text, "test_ping"})
+    sess_pid = SessionRegistry.lookup(user.id)
+    assert is_pid(sess_pid)
+    ref = Process.monitor(sess_pid)
+    poll_until(fn -> Player.lookup_connection(user.id) end, &is_nil/1)
+    send(sess_pid, :connection_timeout)
+    assert_receive({:DOWN, ^ref, :process, _, _}, 1000, "Session should have died")
+  end
+
+  test "session re-setup connection monitor correctly after reconnect", ctx do
+    assert Player.conn_state(ctx.user.id) == :connected
+    Tachyon.abrupt_disconnect!(ctx.client)
+    new_client = Tachyon.connect(ctx.token)
+    Tachyon.abrupt_disconnect!(new_client)
+    poll_until(fn -> Player.conn_state(ctx.user.id) end, &(&1 == :reconnecting))
+  end
+end

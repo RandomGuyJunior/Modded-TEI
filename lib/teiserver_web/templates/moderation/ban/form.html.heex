@@ -1,0 +1,120 @@
+<% bsname = view_colour()
+
+type_colours = %{
+  "hw1" => "danger",
+  "hw2" => "danger",
+  "hw3" => "danger",
+  "client_app_hash" => "warning",
+  "wb1" => "success",
+  "chobby_hash" => "info",
+  "chobby_sysinfo_hash" => "info",
+  "chobby_mac_hash" => "info"
+}
+
+type_icons = %{
+  "hw1" => "fa-computer",
+  "hw2" => "fa-computer",
+  "hw3" => "fa-computer",
+  "client_app_hash" => "fa-code",
+  "wb1" => "fa-globe",
+  "chobby_hash" => "fa-computer",
+  "chobby_sysinfo_hash" => "fa-laptop-code",
+  "chobby_mac_hash" => "fa-laptop-file"
+} %>
+
+<%= form_for @changeset, @action, fn f -> %>
+  <%= if @changeset.action do %>
+    <div class="alert alert-danger">
+      <p>Oops, something went wrong! Please check the errors below.</p>
+    </div>
+  <% end %>
+
+  <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+
+  <div class="row" id="keys-row">
+    <div class="form-group col-md-12 col-lg-6 my-3">
+      {label(f, :reason, class: "control-label")}
+      {text_input(f, :reason, class: "form-control", autofocus: :autofocus)}
+      {error_tag(f, :reason)}
+
+      <div class="mt-4">
+        <span class="btn btn-outline-secondary" onclick="select_all_keys()">
+          Select all keys
+        </span>
+        <span class="btn btn-outline-secondary" onclick="clear_all_keys()">
+          Clear all keys
+        </span>
+      </div>
+    </div>
+
+    <div class="form-group col-md-12 col-lg-6 my-3">
+      {label(f, :extra_values, class: "control-label")}
+      <textarea
+        name="ban[extra_values]"
+        id="ban_extra_values"
+        rows="4"
+        cols="40"
+        class="form-control"
+      ><%= Enum.join(@extra_values, "\n") %></textarea>
+    </div>
+
+    <div class="form-group col-md-12 my-3">
+      <label class="control-label">Hashes:</label>
+      <table class="table table-sm table-hover">
+        <thead>
+          <tr>
+            <th>Type</th>
+            <th>Value</th>
+            <th>Updated</th>
+            <th>&nbsp;</th>
+          </tr>
+        </thead>
+        <tbody>
+          <%= for key <- @all_user_keys do %>
+            <tr>
+              <td>
+                <label for={"ban_type_#{key.value}"}>
+                  <i class={"fa-fw fa-solid #{type_icons[key.type.name]} text-#{type_colours[key.type.name]}"}>
+                  </i>
+                  &nbsp; {key.type.name}
+                </label>
+              </td>
+              <td>
+                <label for={"ban_type_#{key.value}"}>{key.value}</label>
+              </td>
+              <td>
+                <label for={"ban_type_#{key.value}"}>
+                  {date_to_str(key.last_updated, format: :hms_or_ymd)}
+                </label>
+              </td>
+              <td>
+                <.input
+                  type="checkbox"
+                  id={"ban_type_#{key.value}"}
+                  name="ban[key_values][]"
+                  checked={Enum.member?(@ban.key_values, key.value)}
+                  label=""
+                  value={key.value}
+                />
+              </td>
+            </tr>
+          <% end %>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="form-group col-md-3 my-3">
+      <a href={~p"/moderation/ban/#{@ban.id}"} class="btn btn-secondary btn-block">
+        Cancel
+      </a>
+    </div>
+
+    <div class="form-group offset-md-6 col-md-3 my-3">
+      <button type="submit" class={"btn btn-#{bsname} btn-block mt-3"}>
+        Update
+      </button>
+    </div>
+  </div>
+<% end %>

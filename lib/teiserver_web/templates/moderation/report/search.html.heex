@@ -1,0 +1,76 @@
+<% {_fg, _bg, bsname} = view_colour() |> colours() %>
+
+<script type="text/javascript" charset="utf-8">
+  $(function() {
+    $('.datepicker').datepicker({
+      format: "dd/mm/yyyy"
+    });
+  });
+</script>
+
+<div class="search-row">
+  <form
+    action={~p"/moderation/report"}
+    method="get"
+    class="form-horizontal"
+    id="search-box"
+  >
+    <input type="hidden" name="search" value="true" />
+    <input type="hidden" name="limit" value={@params["limit"] || "50"} />
+
+    <div class="row">
+      <div class="col-md-4 col-lg-3 col-xl-2 mt-2">
+        <.input
+          type="select"
+          id="search_state"
+          name="state"
+          label="State"
+          value={@params["state"] || "Open"}
+          options={[
+            "Any",
+            "Open",
+            "Resolved"
+          ]}
+        />
+      </div>
+
+      <div class="col-md-4 col-lg-3 col-xl-2 mt-2">
+        <.input
+          type="select"
+          id="search_kind"
+          name="kind"
+          label="Kind"
+          value={@params["kind"] || "Any"}
+          options={[
+            "Any",
+            "Chat",
+            "Actions"
+          ]}
+        />
+      </div>
+
+      <div class="col-md-4 col-lg-3 col-xl-2 mt-2">
+        <.input
+          type="select"
+          id="search_order"
+          name="search[order]"
+          label="Order by"
+          value={@params["order"] || "Name (A-Z)"}
+          options={[
+            "Name (A-Z)",
+            "Name (Z-A)",
+            "Newest first",
+            "Oldest first"
+          ]}
+        />
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="offset-md-8 col-md-4 offset-xl-10 col-xl-2">
+        &nbsp;<br />
+        <input type="submit" value="Search" class={"btn btn-#{bsname} btn-block"} />
+      </div>
+    </div>
+  </form>
+</div>

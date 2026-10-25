@@ -1,0 +1,115 @@
+defmodule TeiserverWeb.Live.Account.Profile.OverviewTest do
+  alias Teiserver.Battle
+  alias Teiserver.Client
+  alias Teiserver.Helpers.GeneralTestLib
+  alias Teiserver.Lobby
+  alias Teiserver.TeiserverTestLib
+  alias TeiserverWeb.Account.ProfileLive.Overview
+
+  use TeiserverWeb.ConnCase, async: false
+
+  import Phoenix.LiveViewTest
+
+  setup do
+    {:ok, data} =
+      TeiserverTestLib.player_permissions()
+      |> GeneralTestLib.conn_setup()
+      |> TeiserverTestLib.conn_setup()
+
+    profile_user = GeneralTestLib.make_user()
+    login_user(profile_user)
+
+    %{conn: data[:conn], user: data[:user], profile_user: profile_user}
+  end
+
+  describe "join lobby" do
+    test "clicking join joins the client to the user's lobby", %{
+      conn: conn,
+      user: user,
+      profile_user: profile_user
+    } do
+      login_user(user)
+
+      lobby_id = TeiserverTestLib.make_lobby(%{name: "OverviewTestJoin"})
+
+      Battle.force_add_user_to_lobby(profile_user.id, lobby_id)
+
+      {:ok, view, _html} = live(conn, "/profile/#{profile_user.id}")
+
+      view
+      |> element("span[phx-click=join]")
+      |> render_click()
+
+      assert user.id in Battle.get_lobby_member_list(lobby_id)
+
+      assert %{id: ^lobby_id} = Lobby.get_lobby(lobby_id)
+      Lobby.close_lobby(lobby_id)
+      assert Lobby.get_lobby(lobby_id) == nil
+    end
+
+    test "only renders join button when user to join is in a lobby", %{
+      conn: conn,
+      profile_user: profile_user
+    } do
+      lobby_id = TeiserverTestLib.make_lobby(%{name: "OverviewTestJoinRender"})
+
+      {:ok, view, _html} = live(conn, "/profile/#{profile_user.id}")
+
+      refute view
+             |> element("span[phx-click=join]")
+             |> has_element?()
+
+      Battle.force_add_user_to_lobby(profile_user.id, lobby_id)
+
+      assert view
+             |> element("span[phx-click=join]")
+             |> has_element?()
+
+      assert %{id: ^lobby_id} = Lobby.get_lobby(lobby_id)
+      Lobby.close_lobby(lobby_id)
+      assert Lobby.get_lobby(lobby_id) == nil
+    end
+
+    test "renders error flash when client is not connected", %{
+      conn: conn,
+      user: user,
+      profile_user: profile_user
+    } do
+      # Skip client login
+
+      lobby_id = TeiserverTestLib.make_lobby(%{name: "OverviewTestFlash"})
+      assert %{id: ^lobby_id} = Lobby.get_lobby(lobby_id)
+
+      Battle.force_add_user_to_lobby(profile_user.id, lobby_id)
+
+      {:ok, view, _html} = live(conn, "/profile/#{profile_user.id}")
+
+      view
+      |> element("span[phx-click=join]")
+      |> render_click()
+
+      # TODO: fix this
+      # Not rendering for some reason
+      # assert view
+      #        |> element("#flash-group")
+      #        |> render() =~ "Client is not connected"
+
+      # We can ensure they are not in the lobby though
+      refute user.id in Battle.get_lobby_member_list(lobby_id)
+
+      Lobby.close_lobby(lobby_id)
+      assert Lobby.get_lobby(lobby_id) == nil
+    end
+  end
+
+  test "get_accolade_notification_message should be able to handle when user not logged in" do
+    result = Overview.get_accolade_notification_message(nil, nil)
+    assert result == nil
+  end
+
+  defp login_user(user) do
+    user
+    |> Map.merge(%{rank: 1})
+    |> Client.login(:spring, "127.0.0.1")
+  end
+end

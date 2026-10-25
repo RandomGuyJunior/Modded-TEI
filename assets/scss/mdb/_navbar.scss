@@ -1,0 +1,63 @@
+// Navbar
+
+.navbar {
+  box-shadow: $navbar-box-shadow;
+  padding-top: $navbar-padding-top;
+}
+
+.navbar-toggler {
+  border: 0;
+
+  &:focus {
+    box-shadow: none;
+  }
+}
+
+.navbar-dark .navbar-toggler,
+.navbar-light .navbar-toggler {
+  border: 0;
+}
+
+.navbar-brand {
+  display: flex;
+  align-items: center;
+  img {
+    margin-right: $navbar-brand-img-margin-right;
+  }
+}
+
+.navbar-nav .dropdown-menu {
+  position: absolute;
+}
+
+// Only apply absolute positioning when navbar is expanded (not collapsed)
+@media (min-width: 992px) {
+  .navbar-nav .dropdown-menu {
+    position: absolute;
+  }
+}
+
+// When navbar is collapsed, let dropdowns flow naturally
+@media (max-width: 991px) {
+  .navbar-nav .dropdown-menu {
+    position: static;
+    float: none;
+    width: auto;
+    margin-top: 0;
+    background-color: transparent;
+    border: 0;
+    box-shadow: none;
+  }
+}
+
+.navbar-light {
+  .navbar-toggler-icon {
+    background-image: none;
+  }
+}
+
+.navbar-dark {
+  .navbar-toggler-icon {
+    background-image: none;
+  }
+}

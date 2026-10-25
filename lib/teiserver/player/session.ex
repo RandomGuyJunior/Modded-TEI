@@ -1,0 +1,2132 @@
+defmodule Teiserver.Player.Session do
+  @moduledoc """
+  A session has a link to a player connection, but can outlive it.
+  This is a separate process that should be used to check whether a player
+  is online.
+
+  It holds very minimal state regarding the connection.
+  """
+
+  alias Phoenix.PubSub
+  alias Plug.Crypto
+  alias Teiserver.Account
+  alias Teiserver.Account.User
+  alias Teiserver.Data.Types, as: T
+  alias Teiserver.Helpers.BoundedQueue, as: BQ
+  alias Teiserver.Helpers.MonitorCollection, as: MC
+  alias Teiserver.KvStore
+  alias Teiserver.Matchmaking
+  alias Teiserver.Matchmaking.QueueServer
+  alias Teiserver.Messaging
+  alias Teiserver.Party
+  alias Teiserver.Party.Types, as: PartyTypes
+  alias Teiserver.Player.SessionRegistry
+  alias Teiserver.Player.SessionSupervisor
+  alias Teiserver.Player.Types, as: PT
+  alias Teiserver.Player.Types.MessagingState
+  alias Teiserver.Tachyon
+  alias Teiserver.TachyonBattle
+  alias Teiserver.TachyonLobby
+  alias Teiserver.TachyonLobby.Types, as: LT
+
+  # For now, never restart a session. Until some form of state persistence is
+  # implemented it's better to just remove the process completely than
+  # restarting with an invalid state
+  use GenServer, restart: :temporary
+
+  require Logger
+
+  @type conn_state :: :connected | :reconnecting | :disconnected
+
+  @typedoc """
+  the parts of the session state that go into a `user/self` event
+  """
+  @type self_state :: %{
+          party: PartyTypes.Overview.t() | nil,
+          invited_to_parties: [PartyTypes.Overview.t()],
+          current_lobby: TachyonLobby.id() | nil,
+          current_battle: PT.BattleState.t() | nil,
+          matchmaking: PT.Data.matchmaking_state()
+        }
+
+  @connection_timeout :timer.seconds(30)
+
+  def start_link({user_id, arg}) do
+    GenServer.start_link(__MODULE__, arg, name: via_tuple(user_id))
+  end
+
+  @impl GenServer
+  @spec init({:manual, pid(), T.user()} | {:snapshot, term()}) ::
+          {:ok, PT.Data.t()} | {:continue, term()}
+  def init({:manual, conn_pid, user}) do
+    Process.flag(:trap_exit, true)
+    Logger.metadata(actor_type: :session, user_id: user.id, actor_id: user.id)
+
+    state =
+      initial_empty_state(user)
+      |> Map.update!(:monitors, &MC.monitor(&1, conn_pid, :connection))
+      |> Map.replace!(:conn_pid, conn_pid)
+
+    broadcast_user_update!(user, :menu)
+
+    Logger.debug("init session #{inspect(self())}")
+    Logger.info("session started")
+
+    {:ok, state}
+  end
+
+  def init({:snapshot, snapshot}) do
+    Logger.metadata(actor_type: :session, actor_id: snapshot.user_id)
+    {:ok, %{}, {:continue, {:snapshot, snapshot}}}
+  end
+
+  defp initial_matchmaking_state do
+    :no_matchmaking
+  end
+
+  defp initial_empty_state(user) do
+    %PT.Data{
+      user: user,
+      monitors: MC.new(),
+      conn_pid: nil,
+      matchmaking: initial_matchmaking_state(),
+      messaging_state: MessagingState.default(),
+      user_subscriptions: MapSet.new(),
+      party: %PT.PartyState{},
+      battle: nil,
+      lobby: nil,
+      lobby_list_subscription: nil
+    }
+  end
+
+  @impl GenServer
+  def terminate(:shutdown, %PT.Data{} = state) do
+    if Tachyon.should_restore_state?() do
+      # store more stuff as we enable the restoration of
+      # more state at startup
+      to_save =
+        %{
+          user_id: state.user.id,
+          party: state.party,
+          lobby_id: get_in(state.lobby.id)
+        }
+        |> :erlang.term_to_binary()
+
+      KvStore.put("session", to_string(state.user.id), to_save)
+    end
+  end
+
+  def terminate(_reason, _state), do: nil
+
+  ################################################################################
+  #                                                                              #
+  #                                    API                                       #
+  #                                                                              #
+  ################################################################################
+
+  @doc """
+  Retrieve the connection state for the given user
+  """
+  @spec conn_state(User.id()) :: conn_state()
+  def conn_state(user_id) do
+    user_id |> via_tuple() |> GenServer.call(:conn_state)
+  catch
+    :exit, {:noproc, _details} ->
+      :disconnected
+  end
+
+  @doc """
+  Cleanly disconnect the user, clearing any state
+  """
+  @spec disconnect(User.id()) :: :ok
+  def disconnect(user_id) do
+    # the registry will automatically unregister when the process terminates
+    # but that can lead to race conditions when a player disconnect and
+    # reconnect immediately
+    SessionRegistry.unregister(user_id)
+    user_id |> via_tuple() |> GenServer.call(:disconnect)
+  end
+
+  # Used only for tests
+  @doc false
+  def trigger_connection_timeout(pid), do: send(pid, :connection_timeout)
+
+  @spec join_queues(User.id(), [Matchmaking.queue_ref()]) ::
+          :ok | Matchmaking.join_error()
+  def join_queues(user_id, queue_ids) do
+    user_id |> via_tuple() |> GenServer.call({:matchmaking, {:join_queues, queue_ids}})
+  end
+
+  @doc """
+  Leave all the queues, and effectively removes the player from any matchmaking
+  """
+  @spec leave_queues(User.id()) :: Matchmaking.leave_result()
+  def leave_queues(user_id) do
+    user_id |> via_tuple() |> GenServer.call({:matchmaking, :leave_queues})
+  end
+
+  @doc """
+  A match has been found and the player is expected to ready up
+  """
+  @spec matchmaking_notify_found(User.id(), Matchmaking.queue_id(), pid(), timeout()) :: :ok
+  def matchmaking_notify_found(user_id, queue_id, room_pid, timeout_ms) do
+    user_id
+    |> via_tuple()
+    |> GenServer.cast({:matchmaking, {:notify_found, queue_id, room_pid, timeout_ms}})
+  end
+
+  @doc """
+  The player is ready for the match
+  """
+  @spec matchmaking_ready(User.id()) :: :ok | {:error, :no_match}
+  def matchmaking_ready(user_id) do
+    user_id |> via_tuple() |> GenServer.call({:matchmaking, :ready})
+  end
+
+  @spec matchmaking_notify_lost(User.id(), Matchmaking.lost_reason()) :: :ok
+  def matchmaking_notify_lost(user_id, reason) do
+    user_id |> via_tuple() |> GenServer.cast({:matchmaking, {:lost, reason}})
+  end
+
+  @spec matchmaking_notify_cancelled(User.id(), Matchmaking.cancelled_reason()) :: :ok
+  def matchmaking_notify_cancelled(user_id, reason) do
+    user_id |> via_tuple() |> GenServer.cast({:matchmaking, {:cancelled, reason}})
+  end
+
+  @spec matchmaking_found_update(User.id(), non_neg_integer(), pid()) :: :ok
+  def matchmaking_found_update(user_id, ready_count, room_pid) do
+    user_id
+    |> via_tuple()
+    |> GenServer.cast({:matchmaking, {:found_update, ready_count, room_pid}})
+  end
+
+  @type start_data :: %{
+          ips: [String.t()],
+          port: integer(),
+          engine: %{version: String.t()},
+          game: %{spring_name: String.t()},
+          map: %{spring_name: String.t()}
+        }
+
+  @doc """
+  Let the player know that they are now in a battle
+  """
+  @spec battle_start(User.id(), {TachyonBattle.id(), pid()}, start_data(), password :: String.t()) ::
+          :ok
+  def battle_start(user_id, battle_data, battle_start_data, password) do
+    user_id
+    |> via_tuple()
+    |> GenServer.cast({:battle, {:start, battle_data, battle_start_data, password}})
+  end
+
+  @doc """
+  Let the player know that the lobby they are in as just started a battle
+  """
+  @spec lobby_join_battle(
+          User.id(),
+          {TachyonBattle.id(), pid()},
+          start_data(),
+          password :: String.t()
+        ) ::
+          :ok
+  def lobby_join_battle(user_id, battle_data, battle_start_data, password) do
+    user_id
+    |> via_tuple()
+    |> GenServer.cast({:battle, {:start, battle_data, battle_start_data, password}})
+  end
+
+  def notify_left_lobby(user_id, lobby_id, reason) do
+    user_id
+    |> via_tuple()
+    |> GenServer.cast({:lobby, {:left, lobby_id, reason}})
+  end
+
+  @doc """
+  notify the teiserver side that the player left a battle. This is coming
+  from the engine
+  """
+  @spec notify_battle_left(User.id(), TachyonBattle.id()) :: :ok
+  def notify_battle_left(user_id, battle_id) do
+    user_id |> via_tuple() |> GenServer.cast({:battle, {:left, battle_id}})
+  end
+
+  @doc """
+  this user should now receive all messaging events
+  """
+  @spec subscribe_received(
+          user_id :: User.id(),
+          since :: :latest | :from_start | {:marker, term()}
+        ) :: {:ok, has_missed_messages :: boolean(), msg_to_send :: [Messaging.message()]}
+  def subscribe_received(user_id, since) do
+    user_id |> via_tuple() |> GenServer.call({:messaging, {:subscribe, since}})
+  end
+
+  @doc """
+  Attempt to send a dm to the target player. If there is no session for this
+  player the message is lost
+  """
+  @spec send_dm(User.id(), Messaging.message()) :: :ok
+  def send_dm(user_id, message) do
+    user_id |> via_tuple() |> GenServer.cast({:messaging, {:dm, message}})
+  end
+
+  @spec send_party_message(User.id(), String.t()) :: :ok | {:error, reason :: term()}
+  def send_party_message(user_id, message_content) do
+    user_id |> via_tuple() |> GenServer.call({:messaging, {:send_party_message, message_content}})
+  end
+
+  @spec send_lobby_message(User.id(), String.t()) :: :ok | {:error, reason :: term()}
+  def send_lobby_message(user_id, message_content) do
+    user_id |> via_tuple() |> GenServer.call({:messaging, {:send_lobby_message, message_content}})
+  end
+
+  @doc """
+  notify the connected player that they received a new friend request.
+  If the player isn't connected it's a no-op. They'll get the friend request
+  as part of the friend/list response next time they connect.
+  """
+  @spec friend_request_received(target_id :: User.id(), originator_id :: User.id()) :: :ok
+  def friend_request_received(target_id, originator_id) do
+    target_id |> via_tuple() |> GenServer.cast({:friend, {:request_received, originator_id}})
+  end
+
+  @doc """
+  notify the connected player that a pending friend request has been cancelled
+  If the player isn't connected it's a no-op.
+  """
+  @spec friend_request_cancelled(target_id :: User.id(), originator_id :: User.id()) :: :ok
+  def friend_request_cancelled(target_id, originator_id) do
+    target_id |> via_tuple() |> GenServer.cast({:friend, {:request_cancelled, originator_id}})
+  end
+
+  @doc """
+  notify the connected originator player that their friend request
+  has been accepted by the target.
+  """
+  @spec friend_request_accepted(originator_id :: User.id(), target_id :: User.id()) :: :ok
+  def friend_request_accepted(originator_id, target_id) do
+    originator_id |> via_tuple() |> GenServer.cast({:friend, {:request_accepted, target_id}})
+  end
+
+  @doc """
+  notify the connected originator player that their friend request
+  has been rejected by the target.
+  """
+  @spec friend_request_rejected(originator_id :: User.id(), target_id :: User.id()) :: :ok
+  def friend_request_rejected(originator_id, target_id) do
+    originator_id |> via_tuple() |> GenServer.cast({:friend, {:request_rejected, target_id}})
+  end
+
+  @doc """
+  notify the connected player that they have been removed from a friendlist
+  by the given user
+  """
+  @spec friend_request_rejected(user_id :: User.id(), from_id :: User.id()) :: :ok
+  def friend_removed(user_id, from_id) do
+    user_id |> via_tuple() |> GenServer.cast({:friend, {:removed, from_id}})
+  end
+
+  @doc """
+  To forcefully disconnect a connected player and replace this connection
+  with another one. This is to avoid having the same player with several
+  connections.
+  """
+  @spec replace_connection(pid(), pid()) ::
+          {:ok, old_conn_pid :: pid() | nil, self_state()} | :died
+  def replace_connection(sess_pid, new_conn_pid) do
+    GenServer.call(sess_pid, {:replace, new_conn_pid})
+  catch
+    :exit, _reason ->
+      :died
+  end
+
+  @doc """
+  Subscribe the session process to user updates. This will also ensure the first
+  message processed from these channel is the full user state
+  """
+  @spec subscribe_updates(User.id(), [User.id()]) :: :ok | {:error, {:invalid_ids, [integer()]}}
+  def subscribe_updates(originator_id, user_ids) do
+    originator_id |> via_tuple() |> GenServer.call({:user, {:subscribe_updates, user_ids}})
+  end
+
+  @spec unsubscribe_updates(User.id(), [User.id()]) ::
+          :ok | {:error, {:invalid_ids, [integer()]}}
+  def unsubscribe_updates(originator_id, user_ids) do
+    originator_id |> via_tuple() |> GenServer.call({:user, {:unsubscribe_updates, user_ids}})
+  end
+
+  @doc """
+  get the transient user public infos like status (playing/menu ...)
+  """
+  def get_user_info(user_id) do
+    user_id |> via_tuple() |> GenServer.call({:user, :get_info})
+  catch
+    :exit, _reason ->
+      %{status: :offline}
+  end
+
+  @doc """
+  Sends a user/self event to a user when their roles are updated
+  """
+  @spec update_user_roles(User.id(), [String.t()]) :: :ok
+  def update_user_roles(user_id, roles) do
+    user_id |> via_tuple() |> GenServer.cast({:user, {:role_updated, roles}})
+  end
+
+  @spec create_party(User.id()) ::
+          {:ok, PartyTypes.Overview.t()}
+          | {:error, :already_in_party}
+          | {:error, reason :: term()}
+  def create_party(user_id) do
+    user_id |> via_tuple() |> GenServer.call({:party, :create})
+  end
+
+  @spec leave_party(User.id()) :: :ok | {:error, :not_a_member} | {:error, reason :: term()}
+  def leave_party(user_id) do
+    user_id |> via_tuple() |> GenServer.call({:party, :leave})
+  end
+
+  @spec invite_to_party(User.id(), User.id()) ::
+          :ok | {:error, :not_in_a_party | :already_invited | :invalid_player | :timeout}
+  def invite_to_party(user_id, invited_user_id) do
+    user_id |> via_tuple() |> GenServer.call({:party, {:invite, invited_user_id}})
+  end
+
+  @spec accept_invite_to_party(User.id(), Party.id()) ::
+          :ok | {:error, :not_in_a_party | :not_invited}
+  def accept_invite_to_party(user_id, party_id) do
+    user_id |> via_tuple() |> GenServer.call({:party, {:accept_invite, party_id}})
+  end
+
+  @spec decline_invite_to_party(User.id(), Party.id()) ::
+          :ok | {:error, :not_in_a_party | :not_invited}
+  def decline_invite_to_party(user_id, party_id) do
+    user_id |> via_tuple() |> GenServer.call({:party, {:decline_invite, party_id}})
+  end
+
+  @spec cancel_invite_to_party(User.id(), User.id()) ::
+          :ok | {:error, :not_in_a_party | :not_invited}
+  def cancel_invite_to_party(user_id, invited_user_id) do
+    user_id |> via_tuple() |> GenServer.call({:party, {:cancel_invite, invited_user_id}})
+  end
+
+  @spec kick_party_member(actor_id :: User.id(), target_id :: User.id()) ::
+          :ok | {:error, :invalid_party | :invalid_target | :not_a_member}
+  def kick_party_member(actor_id, target_id) do
+    actor_id |> via_tuple() |> GenServer.call({:party, {:kick_player, target_id}})
+  end
+
+  @spec party_notify_invited(User.id(), PartyTypes.Overview.t()) :: :ok
+  def party_notify_invited(user_id, %PartyTypes.Overview{} = party_state) do
+    user_id |> via_tuple() |> GenServer.cast({:party, {:invited, party_state}})
+  end
+
+  @spec party_notify_updated(User.id(), PartyTypes.Overview.t()) :: :ok
+  def party_notify_updated(user_id, %PartyTypes.Overview{} = party_state) do
+    user_id |> via_tuple() |> GenServer.cast({:party, {:updated, party_state}})
+  end
+
+  @spec party_notify_removed(User.id(), PartyTypes.Overview.t()) :: :ok
+  def party_notify_removed(user_id, %PartyTypes.Overview{} = party_state) do
+    user_id |> via_tuple() |> GenServer.cast({:party, {:removed, party_state}})
+  end
+
+  @spec party_notify_join_queues(
+          User.id(),
+          [Matchmaking.queue_ref()],
+          PartyTypes.Overview.t()
+        ) :: :ok
+  def party_notify_join_queues(user_id, queues, %PartyTypes.Overview{} = party_state) do
+    user_id |> via_tuple() |> GenServer.cast({:party, {:join_queues, queues, party_state}})
+  end
+
+  @typedoc """
+  the same as Lobby.start_params, but without any creator data, these are filled by the session
+  """
+  @type lobby_start_params :: PT.LobbyStartParams.t()
+  @spec create_lobby(User.id(), lobby_start_params()) ::
+          {:ok, LT.Details.t()} | {:error, reason :: term()}
+  def create_lobby(user_id, %PT.LobbyStartParams{} = start_params) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, {:create, start_params}})
+  end
+
+  @spec lobby_join(User.id(), TachyonLobby.id()) ::
+          {:ok, LT.Details.t()}
+          | {:error, :banned, ban_until :: DateTime.t()}
+          | {:error, reason :: term()}
+  def lobby_join(user_id, lobby_id) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, {:join, lobby_id}})
+  end
+
+  @spec lobby_leave(User.id()) :: :ok | {:error, reason :: term()}
+  def lobby_leave(user_id) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :leave})
+  end
+
+  @spec lobby_join_ally_team(User.id(), ally_team_idx :: non_neg_integer()) ::
+          :ok | {:error, reason :: term()}
+  def lobby_join_ally_team(user_id, ally_team) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, {:join_ally_team, ally_team}})
+  end
+
+  @spec lobby_spectate(User.id()) :: :ok | {:error, reason :: term()}
+  def lobby_spectate(user_id) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :spectate})
+  end
+
+  @spec lobby_join_queue(User.id()) :: :ok | {:error, reason :: term()}
+  def lobby_join_queue(user_id) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :join_queue})
+  end
+
+  @spec lobby_add_bot(
+          User.id(),
+          ally_team :: non_neg_integer(),
+          short_name :: String.t(),
+          opts :: TachyonLobby.add_bot_opts()
+        ) :: {:ok, bot_id :: String.t()} | {:error, reason :: term()}
+  def lobby_add_bot(user_id, ally_team, short_name, opts \\ []) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :add_bot, ally_team, short_name, opts})
+  end
+
+  @spec lobby_remove_bot(User.id(), bot_id :: String.t()) ::
+          :ok | {:error, :invalid_bot_id | term()}
+  def lobby_remove_bot(user_id, bot_id) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :remove_bot, bot_id})
+  end
+
+  @spec lobby_update_bot(User.id(), TachyonLobby.bot_update_data()) ::
+          :ok | {:error, :invalid_bot_id | term()}
+  def lobby_update_bot(user_id, data) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :update_bot, data})
+  end
+
+  @spec lobby_update_properties(User.id(), TachyonLobby.lobby_update_data()) ::
+          :ok | {:error, :invalid_lobby | term()}
+  def lobby_update_properties(user_id, data) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :update_properties, data})
+  end
+
+  @spec lobby_vote_submit(User.id(), String.t(), TachyonLobby.vote_ballot()) ::
+          :ok | {:error, :invalid_lobby | term()}
+  def lobby_vote_submit(user_id, vote_id, ballot) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :vote_submit, vote_id, ballot})
+  end
+
+  @spec lobby_kickban(User.id(), target_id :: User.id(), ban_until :: DateTime.t() | nil) ::
+          :ok | {:error, reason :: term()}
+  def lobby_kickban(user_id, target_id, ban_until \\ nil) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, {:kickban, target_id, ban_until}})
+  end
+
+  @spec lobby_appoint_boss(User.id(), User.id()) ::
+          :ok | {:error, :invalid_lobby | term()}
+  def lobby_appoint_boss(user_id, appointee_id) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :appoint_boss, appointee_id})
+  end
+
+  @spec lobby_unboss(User.id(), User.id()) ::
+          :ok | {:error, :invalid_lobby | term()}
+  def lobby_unboss(user_id, boss_id) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :unboss, boss_id})
+  end
+
+  @spec lobby_update_client_status(User.id(), TachyonLobby.client_status_update_data()) ::
+          :ok | {:error, :invalid_lobby | term()}
+  def lobby_update_client_status(user_id, data) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :update_client_status, data})
+  end
+
+  @spec lobby_start_battle(User.id()) :: :ok | {:error, reason :: term}
+  def lobby_start_battle(user_id) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :start_battle})
+  end
+
+  @spec lobby_join_battle(User.id()) :: :ok | {:error, reason :: term}
+  def lobby_join_battle(user_id) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :join_battle})
+  end
+
+  @spec subscribe_lobby_list(User.id()) :: {:ok, %{TachyonLobby.id() => LT.ListOverview.t()}}
+  def subscribe_lobby_list(user_id) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :subscribe_list})
+  end
+
+  @spec unsubscribe_lobby_list(User.id()) :: :ok
+  def unsubscribe_lobby_list(user_id) do
+    user_id |> via_tuple() |> GenServer.call({:lobby, :unsubscribe_list})
+  end
+
+  @doc """
+  Used in test to force the batched updates to be sent without having to wait
+  """
+  def flush_lobby_list_updates(session_pid) do
+    send(session_pid, :flush_lobby_list_updates)
+  end
+
+  def restore_sessions do
+    Teiserver.Tachyon.System.restore_state("session", __MODULE__, :restore_session)
+  end
+
+  def restore_session(_blob_key, blob_value) do
+    snapshot = Crypto.non_executable_binary_to_term(blob_value, [:safe])
+
+    SessionSupervisor.start_session_from_snapshot(snapshot.user_id, snapshot)
+  end
+
+  ################################################################################
+  #                                                                              #
+  #                       INTERNAL MESSAGE HANDLERS                              #
+  #                                                                              #
+  ################################################################################
+
+  @impl GenServer
+  def handle_continue({:snapshot, snapshot}, _state) do
+    user = Account.get_user!(snapshot.user_id)
+
+    state = initial_empty_state(user)
+
+    with {:ok, state} <- restore_parties(state, snapshot.party),
+         {:ok, state} <- rejoin_lobby(state, snapshot.lobby_id) do
+      broadcast_user_update!(user, :menu)
+
+      Logger.debug("session restored from snapshot")
+
+      {:ok, _tref} = :timer.send_after(@connection_timeout, :connection_timeout)
+      {:noreply, state}
+    else
+      {:error, err} ->
+        Logger.warning("Could not restore session: #{inspect(err)}")
+        {:stop, :normal}
+    end
+  end
+
+  defp restore_parties(state, party_snapshot) do
+    with {:ok, state} <- rejoin_current_party(state, party_snapshot) do
+      rejoin_invite_parties(state, party_snapshot)
+    end
+  end
+
+  defp rejoin_current_party(state, party_snapshot) do
+    if party_snapshot.current_party == nil do
+      {:ok, state}
+    else
+      case Party.rejoin(party_snapshot.current_party, state.user.id) do
+        {:ok, %PartyTypes.Overview{} = party_state} ->
+          state =
+            state
+            |> Map.update!(:party, fn p ->
+              %{p | current_party: party_state.id, version: party_state.version}
+            end)
+            |> Map.update!(:monitors, &MC.monitor(&1, party_state.pid, :current_party))
+
+          {:ok, state}
+
+        x ->
+          x
+      end
+    end
+  end
+
+  defp rejoin_invite_parties(state, party_snapshot) do
+    result =
+      Enum.reduce_while(party_snapshot.invited_to, state, fn {_version, id}, state ->
+        case Party.rejoin(id, state.user.id) do
+          {:ok, %PartyTypes.Overview{} = party_state} ->
+            state =
+              state
+              |> update_in([Access.key!(:party), Access.key!(:invited_to)], fn invites ->
+                [{party_state.version, id} | invites]
+              end)
+              |> Map.update!(
+                :monitors,
+                &MC.monitor(&1, party_state.pid, {:invited_to_party, id})
+              )
+
+            {:cont, state}
+
+          x ->
+            # for simplicity, "undo" everything, even if not yet there
+            for id <- party_snapshot.invited_ids do
+              MC.demonitor_by_val(state.monitors, {:invited_to_party, id})
+            end
+
+            {:halt, x}
+        end
+      end)
+
+    case result do
+      {:error, err} -> {:error, err}
+      st -> {:ok, st}
+    end
+  end
+
+  defp rejoin_lobby(state, nil), do: {:ok, state}
+
+  defp rejoin_lobby(state, lobby_id) do
+    case TachyonLobby.rejoin(lobby_id, state.user.id) do
+      {:ok, lobby_pid, %LT.Details{} = details} ->
+        state =
+          state
+          |> Map.update!(:monitors, &MC.monitor(&1, lobby_pid, {:lobby, details.id}))
+          |> Map.put(:lobby, %{id: details.id})
+
+        {:ok, state}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl GenServer
+  def handle_call({:replace, new_conn_pid}, _from, %PT.Data{} = state) do
+    original_conn_pid = state.conn_pid
+
+    monitors =
+      MC.demonitor_by_val(state.monitors, :connection, [:flush])
+      |> MC.monitor(new_conn_pid, :connection)
+
+    Logger.info("session reused")
+
+    {current_party, invited_to} = get_party_states(state.party)
+
+    party_state =
+      %PT.PartyState{
+        version: if(current_party == nil, do: nil, else: current_party.version),
+        current_party: if(current_party == nil, do: nil, else: current_party.id),
+        invited_to: Enum.map(invited_to, fn st -> {st.version, st.id} end)
+      }
+
+    new_state = %{state | conn_pid: new_conn_pid, monitors: monitors, party: party_state}
+
+    self_state = build_self_state(state)
+
+    {:reply, {:ok, original_conn_pid, self_state}, new_state}
+  end
+
+  def handle_call(:conn_state, _from, %PT.Data{} = state) do
+    result = if is_nil(state.conn_pid), do: :reconnecting, else: :connected
+    {:reply, result, state}
+  end
+
+  def handle_call(:disconnect, _from, %PT.Data{} = state) do
+    user_id = state.user.id
+
+    case state.matchmaking do
+      {:searching, %PT.MmSearchingState{joined_queues: joined_queues}} ->
+        Enum.each(joined_queues, fn queue_id ->
+          QueueServer.leave_queue(queue_id, user_id)
+        end)
+
+      _other ->
+        nil
+    end
+
+    broadcast_user_update!(state.user, :offline)
+    :telemetry.execute([:tachyon, :disconnect], %{count: 1})
+
+    {:stop, :normal, :ok, %{state | matchmaking: initial_matchmaking_state()}}
+  end
+
+  # this should never happen because the json schema already checks for minimum length
+  def handle_call({:matchmaking, {:join_queues, []}}, _from, %PT.Data{} = state),
+    do: {:reply, {:error, :invalid_request}, state}
+
+  def handle_call({:matchmaking, {:join_queues, queues}}, _from, %PT.Data{} = state) do
+    case state.matchmaking do
+      :no_matchmaking ->
+        case state.party.current_party do
+          nil ->
+            case join_matchmaking(queues, state) do
+              {:ok, new_state} ->
+                {:reply, :ok, new_state}
+
+              {:error, err} ->
+                {:reply, {:error, err}, state}
+            end
+
+          party_id ->
+            with :ok <- Party.join_queues(party_id, queues),
+                 {:ok, new_state} <- join_matchmaking(queues, state) do
+              {:reply, :ok, new_state}
+            else
+              {:error, reason} -> {:reply, {:error, reason}, state}
+            end
+        end
+
+      {:searching, _search_state} ->
+        {:reply, {:error, :already_queued}, state}
+
+      {:pairing, _pairing_state} ->
+        {:reply, {:error, :already_queued}, state}
+    end
+  end
+
+  def handle_call({:matchmaking, :leave_queues}, _from, %PT.Data{} = state) do
+    {resp, state} = leave_matchmaking(state)
+    {:reply, resp, state}
+  end
+
+  def handle_call({:matchmaking, :ready}, _from, %PT.Data{} = state) do
+    case state.matchmaking do
+      {:pairing, %PT.MmPairingState{room: room_pid} = pairing_state} ->
+        data = %{
+          user_id: state.user.id,
+          name: state.user.name
+        }
+
+        new_state = %{state | matchmaking: {:pairing, %{pairing_state | readied?: true}}}
+
+        {:reply, Matchmaking.ready(room_pid, data), new_state}
+
+      _other ->
+        {:reply, {:error, :no_match}, state}
+    end
+  end
+
+  def handle_call({:messaging, {:subscribe, since}}, _from, %PT.Data{} = state) do
+    state =
+      Map.update!(state, :messaging_state, fn %MessagingState{} = st ->
+        %{st | subscribed?: true, store_messages?: true}
+      end)
+
+    buffer = state.messaging_state.buffer
+
+    # Keep the history, even if it is sent to the player. This may be a
+    # problem in the long run because the buffer are never emptied, but for
+    # now it’ll do
+    {msg_to_send, has_missed_messages} =
+      case since do
+        :latest ->
+          {[], false}
+
+        :from_start ->
+          {BQ.to_list(buffer), BQ.dropped?(buffer)}
+
+        {:marker, :invalid} ->
+          {BQ.to_list(buffer), true}
+
+        {:marker, marker} ->
+          {seen, not_seen} = BQ.split_when(buffer, fn msg -> msg.marker == marker end)
+
+          if is_nil(not_seen) do
+            {BQ.to_list(seen), true}
+          else
+            {BQ.to_list(not_seen), false}
+          end
+      end
+
+    {:reply, {:ok, has_missed_messages, msg_to_send}, state}
+  end
+
+  def handle_call(
+        {:messaging, {:send_party_message, _message_content}},
+        _from,
+        %PT.Data{} = state
+      )
+      when state.party.current_party == nil,
+      do: {:reply, {:error, "not in party"}}
+
+  def handle_call({:messaging, {:send_party_message, message_content}}, _from, %PT.Data{} = state) do
+    case Party.send_message(state.party.current_party, state.user.id, message_content) do
+      :ok -> {:reply, :ok, state}
+      {:error, :invalid_request, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call(
+        {:messaging, {:send_lobby_message, _content}},
+        _from,
+        %PT.Data{} = %PT.Data{} = state
+      )
+      when state.lobby == nil,
+      do: {:reply, {:error, "not in lobby"}, state}
+
+  def handle_call({:messaging, {:send_lobby_message, message_content}}, _from, %PT.Data{} = state) do
+    case TachyonLobby.send_message(state.lobby.id, state.user.id, message_content) do
+      :ok -> {:reply, :ok, state}
+      {:error, :invalid_request, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:user, {:subscribe_updates, user_ids}}, _from, %PT.Data{} = state) do
+    users = Account.query_users(where: [id_in: user_ids])
+
+    if Enum.count(users) != Enum.count(user_ids) do
+      user_ids_set = MapSet.new(user_ids)
+
+      diff =
+        users
+        |> Enum.map(& &1.id)
+        |> MapSet.new()
+        |> then(&MapSet.difference(user_ids_set, &1))
+        |> MapSet.to_list()
+
+      {:reply, {:error, {:invalid_ids, diff}}, state}
+    else
+      new_state = Map.update!(state, :user_subscriptions, &MapSet.union(&1, MapSet.new(user_ids)))
+      Enum.each(users, &do_subscribe_updates(state.user_subscriptions, &1))
+      {:reply, :ok, new_state}
+    end
+  end
+
+  def handle_call({:user, {:unsubscribe_updates, user_ids}}, _from, %PT.Data{} = state) do
+    user_ids = MapSet.new(user_ids)
+    to_remove = MapSet.intersection(user_ids, state.user_subscriptions)
+
+    for user_id <- to_remove do
+      PubSub.unsubscribe(Teiserver.PubSub, user_topic(user_id))
+    end
+
+    new_subs = MapSet.difference(state.user_subscriptions, user_ids)
+    {:reply, :ok, %{state | user_subscriptions: new_subs}}
+  end
+
+  def handle_call({:user, :get_info}, _from, %PT.Data{} = state) do
+    status =
+      if is_nil(state.battle) do
+        :menu
+      else
+        :playing
+      end
+
+    {:reply, %{status: status}, state}
+  end
+
+  def handle_call({:party, :create}, _from, %PT.Data{} = state)
+      when state.party.current_party != nil,
+      do: {:reply, {:error, :already_in_party}, state}
+
+  def handle_call({:party, :create}, _from, %PT.Data{} = state) do
+    case Party.create_party(state.user.id) do
+      {:ok, %PartyTypes.Overview{} = party_state} ->
+        state =
+          state
+          |> put_in([Access.key!(:party), Access.key!(:current_party)], party_state.id)
+          |> Map.update!(:monitors, &MC.monitor(&1, party_state.pid, :current_party))
+
+        case leave_matchmaking(state) do
+          {:ok, state} ->
+            state = send_to_player(state, {:matchmaking, {:cancelled, :intentional}})
+            {:reply, {:ok, party_state}, state}
+
+          _other ->
+            {:reply, {:ok, party_state}, state}
+        end
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:party, :leave}, _from, %PT.Data{} = state)
+      when is_nil(state.party.current_party),
+      do: {:reply, {:error, :not_in_party}, state}
+
+  def handle_call({:party, :leave}, _from, %PT.Data{} = state) do
+    case do_leave_party(state) do
+      {:error, reason} -> {:reply, {:error, reason}, state}
+      {:ok, new_state} -> {:reply, :ok, new_state}
+    end
+  end
+
+  def handle_call({:party, {:invite, _user_id}}, _from, %PT.Data{} = state)
+      when is_nil(state.party.current_party),
+      do: {:reply, {:error, :not_in_party}, state}
+
+  def handle_call({:party, {:invite, user_id}}, _from, %PT.Data{} = state) do
+    # go through the other session as well to ensure valid and connected player
+    msg = {:party, {:invite, state.party.current_party, user_id}}
+
+    try do
+      case user_id |> via_tuple() |> GenServer.call(msg, :timer.seconds(2)) do
+        :ok -> {:reply, :ok, state}
+        {:error, reason} -> {:reply, {:error, reason}, state}
+      end
+
+      # it is very unlikely that both sessions will call each other at the same time
+      # but if that happens, they will deadlock then timeout
+      # catch that and error out, it's better than crashing the session
+    catch
+      :exit, {:timeout, _details} -> {:reply, {:error, :timeout}}
+    end
+  catch
+    :exit, {:noproc, _details} ->
+      {:reply, {:error, :invalid_player}, state}
+  end
+
+  def handle_call({:party, {:invite, party_id, invited_id}}, _from, %PT.Data{} = state) do
+    case Party.create_invite(party_id, invited_id) do
+      {:ok, %PartyTypes.Overview{} = party_state} ->
+        state =
+          state
+          |> update_in([Access.key!(:party), Access.key!(:invited_to)], fn invited ->
+            [{party_state.version, party_state.id} | invited]
+          end)
+          |> Map.update!(
+            :monitors,
+            &MC.monitor(&1, party_state.pid, {:invited_to_party, party_id})
+          )
+
+        send_to_player!({:party, {:invited, party_state}}, state)
+        {:reply, :ok, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:party, {:accept_invite, party_id}}, _from, %PT.Data{} = state) do
+    state =
+      case do_leave_party(state) do
+        {:ok, new_state} ->
+          new_state
+
+        {:error, :not_in_party} ->
+          state
+
+        # this should never happen, better crash loudly so we can debug that
+        {:error, reason} ->
+          Logger.error("cannot leave party #{inspect(state.party)} - #{inspect(reason)}")
+          raise "Cannot leave a party when joining another??? #{inspect(reason)}"
+      end
+
+    case Party.accept_invite(party_id, state.user.id) do
+      {:ok, party_state} ->
+        state =
+          Map.update!(state, :party, fn %PT.PartyState{} = p ->
+            invited_to = Enum.filter(p.invited_to, fn {_version, p_id} -> p_id != party_id end)
+
+            %{
+              p
+              | invited_to: invited_to,
+                current_party: party_state.id,
+                version: party_state.version
+            }
+          end)
+
+        case leave_matchmaking(state) do
+          {:ok, state} ->
+            state = send_to_player(state, {:matchmaking, {:cancelled, :intentional}})
+            {:reply, :ok, state}
+
+          _other ->
+            {:reply, :ok, state}
+        end
+
+      {:error, _reason} = err ->
+        {:reply, err, state}
+    end
+  end
+
+  def handle_call({:party, {:decline_invite, party_id}}, _from, %PT.Data{} = state) do
+    case Party.decline_invite(party_id, state.user.id) do
+      {:ok, _party_state} ->
+        state =
+          state
+          |> update_in([Access.key!(:party), Access.key!(:invited_to)], fn invited ->
+            Enum.filter(invited, fn {_version, p_id} -> p_id != party_id end)
+          end)
+
+        {:reply, :ok, state}
+
+      {:error, _reason} = err ->
+        {:reply, err, state}
+    end
+  end
+
+  def handle_call({:party, {:cancel_invite, _invited_user_id}}, _from, %PT.Data{} = state)
+      when state.party.current_party == nil do
+    {:reply, {:error, :not_in_party}, state}
+  end
+
+  def handle_call({:party, {:cancel_invite, invited_user_id}}, _from, %PT.Data{} = state) do
+    party_id = state.party.current_party
+
+    case Party.cancel_invite(party_id, invited_user_id) do
+      {:ok, %PartyTypes.Overview{} = party_state} ->
+        state = state |> put_in([Access.key!(:party), Access.key!(:version)], party_state.version)
+
+        {:reply, :ok, state}
+
+      {:error, _reason} = err ->
+        {:reply, err, state}
+    end
+  end
+
+  def handle_call({:party, {:kick_player, _target_id}}, _from, %PT.Data{} = state)
+      when state.party.current_party == nil do
+    {:reply, {:error, :not_in_party}, state}
+  end
+
+  def handle_call({:party, {:kick_player, target_id}}, _from, %PT.Data{} = state) do
+    party_id = state.party.current_party
+
+    case Party.kick_user(party_id, state.user.id, target_id) do
+      {:ok, %PartyTypes.Overview{} = party_state} ->
+        state = state |> put_in([Access.key!(:party), Access.key!(:version)], party_state.version)
+
+        {:reply, :ok, state}
+
+      {:error, _reason} = err ->
+        {:reply, err, state}
+    end
+  end
+
+  def handle_call({:lobby, {:create, _start_params}}, _from, %PT.Data{} = state)
+      when state.lobby != nil,
+      do: {:reply, {:error, :already_in_lobby}, state}
+
+  def handle_call(
+        {:lobby, {:create, %PT.LobbyStartParams{} = start_params}},
+        _from,
+        %PT.Data{} = state
+      ) do
+    data = %LT.StartParams{
+      creator_data: %LT.PlayerJoinData{id: state.user.id, name: state.user.name},
+      creator_pid: self(),
+      name: start_params.name,
+      map_name: start_params.map_name,
+      ally_team_config: start_params.ally_team_config,
+      game_version: start_params.game_version,
+      engine_version: start_params.engine_version,
+      boss_enabled?: start_params.boss_enabled? || false,
+      game_options: start_params.game_options,
+      tags: start_params.tags
+    }
+
+    case TachyonLobby.create(data) do
+      {:ok, pid, details} ->
+        state =
+          state
+          |> Map.update!(:monitors, &MC.monitor(&1, pid, {:lobby, details.id}))
+          |> Map.put(:lobby, %{id: details.id})
+
+        {:reply, {:ok, details}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:lobby, {:join, lobby_id}}, _from, %PT.Data{} = state)
+      when state.lobby.id == lobby_id do
+    join_data = %LT.PlayerJoinData{id: state.user.id, name: state.user.name}
+
+    case TachyonLobby.join(lobby_id, join_data, self()) do
+      # no need to setup any monitors or update the state since we're already in the lobby
+      {:ok, _pid, details} -> {:reply, {:ok, details}, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:lobby, {:join, _lobby_id}}, _from, %PT.Data{} = state)
+      when state.lobby != nil,
+      do: {:reply, {:error, :already_in_lobby}, state}
+
+  def handle_call({:lobby, {:join, lobby_id}}, _from, %PT.Data{} = state) do
+    join_data = %LT.PlayerJoinData{id: state.user.id, name: state.user.name}
+
+    case TachyonLobby.join(lobby_id, join_data, self()) do
+      {:ok, pid, details} ->
+        state =
+          state
+          |> Map.update!(:monitors, &MC.monitor(&1, pid, {:lobby, details.id}))
+          |> Map.put(:lobby, %{id: details.id})
+
+        {:reply, {:ok, details}, state}
+
+      {:error, :banned, ban_until} ->
+        {:reply, {:error, :banned, ban_until}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:lobby, {:join_ally_team, _ally_team}}, _from, %PT.Data{} = state)
+      when is_nil(state.lobby),
+      do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, {:join_ally_team, ally_team}}, _from, %PT.Data{} = state) do
+    resp =
+      case TachyonLobby.join_ally_team(state.lobby.id, state.user.id, ally_team) do
+        {:ok, _details} -> :ok
+        x -> x
+      end
+
+    {:reply, resp, state}
+  end
+
+  def handle_call({:lobby, :spectate}, _from, %PT.Data{} = state) when is_nil(state.lobby),
+    do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :spectate}, _from, %PT.Data{} = state) do
+    {:reply, TachyonLobby.spectate(state.lobby.id, state.user.id), state}
+  end
+
+  def handle_call({:lobby, :join_queue}, _from, %PT.Data{} = state) when is_nil(state.lobby),
+    do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :join_queue}, _from, %PT.Data{} = state) do
+    {:reply, TachyonLobby.join_queue(state.lobby.id, state.user.id), state}
+  end
+
+  def handle_call({:lobby, :add_bot, _ally_team, _short_name, _opts}, _from, %PT.Data{} = state)
+      when is_nil(state.lobby),
+      do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :add_bot, ally_team, short_name, opts}, _from, %PT.Data{} = state) do
+    {:reply, TachyonLobby.add_bot(state.lobby.id, state.user.id, ally_team, short_name, opts),
+     state}
+  end
+
+  def handle_call({:lobby, :remove_bot, _bot_id}, _from, %PT.Data{} = state)
+      when is_nil(state.lobby),
+      do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :remove_bot, bot_id}, _from, %PT.Data{} = state) do
+    {:reply, TachyonLobby.remove_bot(state.lobby.id, bot_id), state}
+  end
+
+  def handle_call({:lobby, :update_bot, _data}, _from, %PT.Data{} = state)
+      when is_nil(state.lobby),
+      do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :update_bot, data}, _from, %PT.Data{} = state) do
+    {:reply, TachyonLobby.update_bot(state.lobby.id, data), state}
+  end
+
+  def handle_call({:lobby, :update_properties, _data}, _from, %PT.Data{} = state)
+      when is_nil(state.lobby),
+      do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :update_properties, data}, _from, %PT.Data{} = state) do
+    {:reply, TachyonLobby.update_properties(state.lobby.id, state.user.id, data), state}
+  end
+
+  def handle_call({:lobby, :vote_submit, _vote_id, _ballot}, _from, %PT.Data{} = state)
+      when is_nil(state.lobby),
+      do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :vote_submit, vote_id, ballot}, _from, %PT.Data{} = state) do
+    {:reply, TachyonLobby.vote_submit(state.lobby.id, state.user.id, {vote_id, ballot}), state}
+  end
+
+  def handle_call({:lobby, {:kickban, _target_id, _ban_until}}, _from, %PT.Data{} = state)
+      when is_nil(state.lobby),
+      do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, {:kickban, target_id, ban_until}}, _from, %PT.Data{} = state) do
+    result = TachyonLobby.kickban(state.lobby.id, state.user.id, target_id, ban_until)
+    {:reply, result, state}
+  end
+
+  def handle_call({:lobby, :appoint_boss, _appointee_id}, _from, %PT.Data{} = state)
+      when is_nil(state.lobby),
+      do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :appoint_boss, appointee_id}, _from, %PT.Data{} = state) do
+    {:reply, TachyonLobby.appoint_boss(state.lobby.id, state.user.id, appointee_id), state}
+  end
+
+  def handle_call({:lobby, :unboss, _boss_id}, _from, %PT.Data{} = state)
+      when is_nil(state.lobby),
+      do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :unboss, boss_id}, _from, %PT.Data{} = state) do
+    {:reply, TachyonLobby.unboss(state.lobby.id, state.user.id, boss_id), state}
+  end
+
+  def handle_call({:lobby, :update_client_status, _data}, _from, %PT.Data{} = state)
+      when is_nil(state.lobby),
+      do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :update_client_status, data}, _from, %PT.Data{} = state) do
+    {:reply, TachyonLobby.update_client_status(state.lobby.id, state.user.id, data), state}
+  end
+
+  def handle_call({:lobby, :leave}, _from, %PT.Data{} = state) when is_nil(state.lobby),
+    do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :leave}, _from, %PT.Data{} = state) do
+    case TachyonLobby.leave(state.lobby.id, state.user.id) do
+      :ok ->
+        state =
+          state
+          |> Map.update!(:monitors, &MC.demonitor_by_val(&1, {:lobby, state.lobby.id}, [:flush]))
+          |> Map.replace!(:lobby, nil)
+
+        {:reply, :ok, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:lobby, :start_battle}, _from, %PT.Data{} = state)
+      when state.lobby == nil,
+      do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :start_battle}, _from, %PT.Data{} = state) do
+    case TachyonLobby.start_battle(state.lobby.id, state.user.id) do
+      # the update of the state wrt to current battle is done by the lobby
+      # itself using Session.battle_start to notify all members
+      # this simplify the request/response cycle by avoiding any interleaving
+      # where the client that starts the battle would receive the server's battle/start
+      # request while waiting for the response to lobby/startBattle response
+      :ok ->
+        {:reply, :ok, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:lobby, :join_battle}, _from, %PT.Data{} = state)
+      when state.lobby == nil,
+      do: {:reply, {:error, :not_in_lobby}, state}
+
+  def handle_call({:lobby, :join_battle}, _from, %PT.Data{} = state) do
+    case TachyonLobby.join_battle(state.lobby.id, state.user.id) do
+      # same note as start_battle
+      :ok ->
+        {:reply, :ok, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:lobby, :subscribe_list}, _from, %PT.Data{} = state) do
+    if state.lobby_list_subscription == nil do
+      list = TachyonLobby.subscribe_updates()
+
+      lobbies =
+        Enum.map(list, fn {id, %LT.ListOverview{counter: counter}} ->
+          {id, %{counter: counter, changes: %{}}}
+        end)
+        |> Enum.into(%{})
+
+      {:ok, ref} = :timer.seconds(5) |> :timer.send_interval(:flush_lobby_list_updates)
+      subscription_state = %{timer_ref: ref, lobbies: lobbies}
+
+      {:reply, {:ok, list}, %{state | lobby_list_subscription: subscription_state}}
+    else
+      list = TachyonLobby.list()
+      {:reply, {:ok, list}, state}
+    end
+  end
+
+  def handle_call({:lobby, :unsubscribe_list}, _from, %PT.Data{} = state) do
+    TachyonLobby.unsubscribe_updates()
+
+    if state.lobby_list_subscription != nil do
+      :timer.cancel(state.lobby_list_subscription.timer_ref)
+      {:reply, :ok, %{state | lobby_list_subscription: nil}}
+    else
+      {:reply, :ok, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_cast(
+        {:matchmaking, {:notify_found, queue_id, room_pid, timeout_ms}},
+        %{matchmaking: {:searching, %{joined_queues: joined}}} = state
+      ) do
+    if Enum.find(joined, fn {qid, _version} -> qid == queue_id end) == nil do
+      {:noreply, state}
+    else
+      state = send_to_player(state, {:matchmaking, {:notify_found, queue_id, timeout_ms}})
+
+      {[paired_queue], other_queues} =
+        Enum.split_with(joined, fn {qid, _version} -> qid == queue_id end)
+
+      monitors =
+        Enum.reduce(other_queues, state.monitors, fn {qid, _version}, monitors ->
+          Matchmaking.leave_queue(qid, state.user.id)
+          MC.demonitor_by_val(monitors, {:mm_queue, qid}, [:flush])
+        end)
+
+      monitors = MC.monitor(monitors, room_pid, :mm_room)
+
+      new_mm_state =
+        {:pairing,
+         %PT.MmPairingState{
+           paired_queue: paired_queue,
+           room: room_pid,
+           frozen_queues: other_queues,
+           readied?: false,
+           timeout_at: DateTime.utc_now() |> DateTime.shift(microsecond: {timeout_ms * 1000, 6})
+         }}
+
+      new_state =
+        state |> Map.put(:matchmaking, new_mm_state) |> Map.replace!(:monitors, monitors)
+
+      {:noreply, new_state}
+    end
+  end
+
+  def handle_cast(
+        {:matchmaking, {:notify_found, _queue_id, room_pid, _timeout_ms}},
+        %PT.Data{} = state
+      ) do
+    # we're not searching anything. This can happen as a race when two queues
+    # match the same player at the same time.
+    # Do log it since it should not happen too often unless something is wrong
+    Logger.info("Got a matchmaking found but in state #{inspect(state.matchmaking)}")
+
+    Matchmaking.cancel(room_pid, state.user.id)
+    {:noreply, state}
+  end
+
+  def handle_cast({:matchmaking, {:lost, reason}}, %PT.Data{} = state) do
+    case state.matchmaking do
+      :no_matchmaking ->
+        {:noreply, state}
+
+      {:searching, _search_state} ->
+        state = send_to_player(state, {:matchmaking, {:notify_lost, reason}})
+        {:noreply, state}
+
+      {:pairing,
+       %PT.MmPairingState{
+         paired_queue: q_id,
+         room: _room_pid,
+         frozen_queues: frozen_queues,
+         readied?: readied
+       }} ->
+        monitors =
+          state.monitors
+          |> MC.demonitor_by_val(:mm_room, [:flush])
+          |> MC.demonitor_by_val({:mm_queue, q_id})
+
+        state = Map.replace!(state, :monitors, monitors)
+
+        q_ids = [q_id | frozen_queues]
+
+        case reason do
+          :timeout when not readied ->
+            state =
+              leave_all_queues(q_ids, state)
+              |> send_to_player({:matchmaking, :notify_lost})
+              |> send_to_player({:matchmaking, {:cancelled, reason}})
+
+            {:noreply, state}
+
+          {:server_error, _details} ->
+            state =
+              leave_all_queues(q_ids, state)
+              |> send_to_player({:matchmaking, :notify_lost})
+              |> send_to_player({:matchmaking, {:cancelled, reason}})
+
+            {:noreply, state}
+
+          _other_reason ->
+            state = send_to_player(state, {:matchmaking, :notify_lost})
+
+            case join_matchmaking(q_ids, state) do
+              {:ok, new_state} ->
+                {:noreply, new_state}
+
+              {:error, _err} ->
+                state = send_to_player(state, {:matchmaking, {:cancelled, :server_error}})
+                {:noreply, %{state | matchmaking: initial_matchmaking_state()}}
+            end
+        end
+    end
+  end
+
+  def handle_cast({:matchmaking, {:cancelled, reason}}, %PT.Data{} = state) do
+    case leave_matchmaking(state) do
+      {:ok, state} ->
+        state = send_to_player(state, {:matchmaking, {:cancelled, reason}})
+        {:noreply, state}
+
+      _other ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_cast({:matchmaking, {:found_update, current, room_pid}}, %PT.Data{} = state) do
+    case state.matchmaking do
+      {:pairing, %PT.MmPairingState{room: ^room_pid}} ->
+        {:noreply, send_to_player(state, {:matchmaking, {:found_update, current}})}
+
+      _other ->
+        {:noreply, state}
+    end
+  end
+
+  # this takes care of the logic when a player is asked to join a battle.
+  # for now, we treat the session's state as the authority, if the player isn't
+  # in the correct matchmaking state or in a lobby, the request is ignored.
+  # Maybe that shouldn't be so and we should treat whatever comes from battle
+  # as the source of truth?
+  def handle_cast(
+        {:battle, {:start, {battle_id, battle_pid}, battle_start_data, password}},
+        %PT.Data{} = state
+      ) do
+    Logger.info("entering battle #{battle_id}")
+
+    new_state =
+      case state do
+        %{matchmaking: {:pairing, %PT.MmPairingState{readied?: true, room: _room_pid}}} ->
+          monitors =
+            MC.demonitor_by_val(state.monitors, :mm_room, [:flush])
+            |> MC.monitor(battle_pid, {:battle, battle_id})
+
+          {:joined, %{state | matchmaking: :no_matchmaking, monitors: monitors}}
+
+        %{lobby: %{id: _lobby_id}} ->
+          monitors = MC.monitor(state.monitors, battle_pid, {:battle, battle_id})
+          {:joined, %{state | monitors: monitors}}
+
+        _other ->
+          Logger.warning(
+            "User received a request to start a battle but is not in a state to do so #{inspect(state)}"
+          )
+
+          {:error, state}
+      end
+
+    case new_state do
+      {:joined, state} ->
+        battle_state = %PT.BattleState{
+          id: battle_id,
+          username: state.user.name,
+          password: password,
+          ips: battle_start_data.ips,
+          port: battle_start_data.port,
+          engine: battle_start_data.engine,
+          game: battle_start_data.game,
+          map: battle_start_data.map
+        }
+
+        state = %{state | battle: battle_state}
+        state = send_to_player(state, {:battle_start, battle_state})
+        # TODO: this should ideally come from an engine event, but in first approximation it'll do
+        broadcast_user_update!(state.user, :playing)
+
+        {:noreply, state}
+
+      {:error, state} ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_cast({:messaging, {:dm, message}}, %PT.Data{} = state) do
+    state =
+      if state.messaging_state.store_messages? do
+        update_in(state.messaging_state.buffer, fn buf -> BQ.put(buf, message) end)
+      else
+        state
+      end
+
+    case {state.messaging_state.subscribed?, state.conn_pid} do
+      {true, pid} when not is_nil(pid) ->
+        send(pid, {:messaging, {:received, message}})
+        {:noreply, state}
+
+      _other ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_cast({:friend, {event, from_id}}, %PT.Data{} = state)
+      when event in [
+             :request_received,
+             :request_cancelled,
+             :request_accepted,
+             :request_rejected,
+             :removed
+           ] do
+    state = send_to_player(state, {:friend, {event, from_id}})
+    {:noreply, state}
+  end
+
+  def handle_cast({:user, :get_subscribe_state}, %PT.Data{} = state) do
+    broadcast_user_update!(state.user, :menu)
+    {:noreply, state}
+  end
+
+  def handle_cast({:user, {:role_updated, roles}}, %PT.Data{} = state) do
+    send_to_player!({:user, {:role_updated, roles, build_self_state(state)}}, state)
+    new_state = %{state | user: %{state.user | roles: roles}}
+    {:noreply, new_state}
+  end
+
+  def handle_cast({:party, {:updated, %PartyTypes.Overview{} = party_state}}, %PT.Data{} = state) do
+    if (state.party.current_party == party_state.id && state.party.version <= party_state.version) ||
+         Enum.any?(state.party.invited_to, fn {v, id} ->
+           id == party_state.id && v <= party_state.version
+         end) do
+      state =
+        if state.party.current_party == party_state.id,
+          do: put_in(state.party.version, party_state.version),
+          else: state
+
+      send_to_player!({:party, {:updated, %PartyTypes.Overview{} = party_state}}, state)
+      {:noreply, state}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_cast({:party, {:removed, %PartyTypes.Overview{} = party_state}}, %PT.Data{} = state) do
+    state =
+      if party_state.id == state.party.current_party do
+        send_to_player!({:party, {:removed, party_state.id}}, state)
+
+        Map.update!(state, :party, fn st ->
+          %{st | version: 0, current_party: nil}
+        end)
+      else
+        case Enum.split_with(state.party.invited_to, fn {_v, id} -> party_state.id == id end) do
+          # got a stray message, maybe the player already left
+          {[], _rest} ->
+            state
+
+          {[_matched], rest} ->
+            send_to_player!({:party, {:removed, party_state.id}}, state)
+            put_in(state.party.invited_to, rest)
+        end
+      end
+
+    {:noreply, state}
+  end
+
+  def handle_cast(
+        {:party, {:join_queues, _queues, %PartyTypes.Overview{} = party_state}},
+        %PT.Data{} = state
+      )
+      when state.party.current_party != party_state.id,
+      do: {:noreply, state}
+
+  def handle_cast(
+        {:party, {:join_queues, queues, %PartyTypes.Overview{} = party_state}},
+        %PT.Data{} = state
+      ) do
+    case state.matchmaking do
+      :no_matchmaking ->
+        case join_matchmaking(queues, state) do
+          {:ok, new_state} ->
+            queue_ids = Enum.map(queues, &elem(&1, 0))
+
+            new_state =
+              put_in(new_state.party.version, party_state.version)
+              |> send_to_player({:matchmaking, {:queues_joined, queue_ids}})
+
+            {:noreply, new_state}
+
+          {:error, err} ->
+            Logger.error("party join queues #{inspect(queues)} but errored with #{inspect(err)}")
+            raise "todo: cancel the matchmaking in the party, don't crash the genserver"
+        end
+
+      {:searching, qs} ->
+        if MapSet.new(queues) == MapSet.new(qs.joined_queues) do
+          # this happens for the player that initiated the queuing in the party
+          # or when 2 players hit "queue" at the same time
+          {:noreply, state}
+        else
+          Logger.error(
+            "party join queues #{inspect(queues)} but already in matchmaking #{inspect(state.matchmaking)}"
+          )
+
+          {:stop, :crash, state}
+        end
+
+      _other ->
+        Logger.error(
+          "party join queues #{inspect(queues)} but already in matchmaking #{inspect(state.matchmaking)}"
+        )
+
+        {:stop, :crash, state}
+    end
+  end
+
+  def handle_cast({:lobby, {:left, lobby_id, _reason}}, %PT.Data{} = state)
+      when state.lobby.id != lobby_id,
+      do: {:noreply, state}
+
+  def handle_cast({:lobby, {:left, lobby_id, reason}}, %PT.Data{} = state) do
+    msg = {:lobby, lobby_id, {:left, reason}}
+    send_to_player!(msg, state)
+    {:noreply, %{state | lobby: nil}}
+  end
+
+  @impl GenServer
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %PT.Data{} = state) do
+    val = MC.get_val(state.monitors, ref)
+    state = Map.update!(state, :monitors, &MC.demonitor_by_val(&1, val))
+
+    case val do
+      nil ->
+        {:noreply, state}
+
+      :connection ->
+        Logger.info("Player disconnected abruptly because #{inspect(reason)}")
+
+        state =
+          state
+          |> Map.put(:conn_pid, nil)
+          |> put_in([Access.key!(:messaging_state), Access.key!(:subscribed?)], false)
+
+        if is_nil(state.battle) do
+          {:ok, _tref} = :timer.send_after(@connection_timeout, :connection_timeout)
+        end
+
+        :telemetry.execute([:tachyon, :abrupt_disconnect], %{count: 1})
+        {:noreply, state}
+
+      {:mm_queue, queue_id} ->
+        case state do
+          %{matchmaking: {:searching, %{joined_queues: joined}}} ->
+            case Enum.find(joined, &(&1 == queue_id)) do
+              nil ->
+                {:noreply, state}
+
+              _found ->
+                state =
+                  leave_all_queues(joined, state)
+                  |> send_to_player({:matchmaking, {:cancelled, :server_error}})
+
+                {:noreply, state}
+            end
+
+          %{matchmaking: {:pairing, %PT.MmPairingState{paired_queue: ^queue_id} = pairing_st}} ->
+            state =
+              leave_all_queues([pairing_st.paired_queue | pairing_st.frozen_queues], state)
+              |> send_to_player({:matchmaking, {:cancelled, :server_error}})
+
+            {:noreply, state}
+
+          _other_state ->
+            {:noreply, state}
+        end
+
+      :mm_room ->
+        case state do
+          %{matchmaking: {:pairing, %PT.MmPairingState{paired_queue: _qid} = pairing_st}} ->
+            state =
+              leave_all_queues([pairing_st.paired_queue | pairing_st.frozen_queues], state)
+              |> send_to_player({:matchmaking, {:cancelled, :server_error}})
+
+            {:noreply, state}
+
+          _other_state ->
+            {:noreply, state}
+        end
+
+      :current_party ->
+        case state do
+          %{party: %PT.PartyState{current_party: party_id}} ->
+            send_to_player!({:party, {:removed, party_id}}, state)
+
+            state =
+              Map.update!(state, :party, fn %PT.PartyState{} = st ->
+                %{st | version: 0, current_party: nil}
+              end)
+
+            {:noreply, state}
+
+          _other_state ->
+            {:noreply, state}
+        end
+
+      {:invited_to_party, party_id} ->
+        case Enum.split_with(state.party.invited_to, fn {_version, p_id} ->
+               p_id == party_id
+             end) do
+          {[_matched], rest} ->
+            send_to_player!({:party, {:removed, party_id}}, state)
+
+            state =
+              Map.update!(state, :party, fn st ->
+                %{st | invited_to: rest}
+              end)
+
+            {:noreply, state}
+
+          _no_match ->
+            {:noreply, state}
+        end
+
+      {:lobby, lobby_id} ->
+        case TachyonLobby.lookup_primary(lobby_id) do
+          nil ->
+            Logger.info("Lobby #{lobby_id} went down because #{inspect(reason)}")
+            send_to_player!({:lobby, lobby_id, {:left, {:error, "lobby crashed"}}}, state)
+            {:noreply, %{state | lobby: nil}}
+
+          pid ->
+            monitors = MC.monitor(state.monitors, pid, {:lobby, lobby_id})
+            {:noreply, %{state | monitors: monitors}}
+        end
+
+      {:battle, battle_id} ->
+        Logger.info("battle #{battle_id} went down because #{inspect(reason)}")
+        broadcast_user_update!(state.user, :menu)
+        new_state = %{state | battle: nil}
+
+        if is_nil(new_state.conn_pid) do
+          {:ok, _tref} = :timer.send_after(@connection_timeout, :connection_timeout)
+        end
+
+        {:noreply, new_state}
+    end
+  end
+
+  def handle_info({:EXIT, from_pid, :normal}, %PT.Data{} = state) when from_pid != self(),
+    do: {:noreply, state}
+
+  # :please_die is used in test
+  def handle_info({:EXIT, _from_pid, :please_die}, %PT.Data{} = state),
+    do: {:stop, :normal, state}
+
+  def handle_info({:EXIT, _from_pid, reason}, %PT.Data{} = state), do: {:stop, reason, state}
+
+  def handle_info(:connection_timeout, %PT.Data{} = state) do
+    if is_nil(state.conn_pid) and is_nil(state.battle) do
+      Logger.debug("Player timed out, stopping session")
+      {:stop, :normal, state}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_info(
+        %{
+          channel: "tachyon:user:" <> _user_id,
+          user_id: user_id,
+          event: :user_updated,
+          state: user_state
+        },
+        state
+      ) do
+    state =
+      if user_id in state.user_subscriptions do
+        send_to_player(state, {:user, {:user_updated, user_state}})
+      else
+        state
+      end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:lobby, lobby_id, _event}, %PT.Data{} = state) when state.lobby.id != lobby_id,
+    do: {:noreply, state}
+
+  def handle_info({:lobby, lobby_id, event}, %PT.Data{} = state) do
+    state = send_to_player(state, {:lobby, lobby_id, event})
+    {:noreply, state}
+  end
+
+  def handle_info(:flush_lobby_list_updates, %PT.Data{} = state)
+      when state.lobby_list_subscription == nil,
+      do: {:noreply, state}
+
+  def handle_info(:flush_lobby_list_updates, %PT.Data{} = state) do
+    {lobbies, changes} =
+      Enum.reduce(state.lobby_list_subscription.lobbies, {%{}, %{}}, fn {lobby_id, data},
+                                                                        {lobbies, changes} ->
+        new_lobbies =
+          if data.changes == nil,
+            do: lobbies,
+            else: Map.put(lobbies, lobby_id, %{counter: data.counter, changes: %{}})
+
+        new_changes =
+          if data.changes == %{},
+            do: changes,
+            else: Map.put(changes, lobby_id, data.changes)
+
+        {new_lobbies, new_changes}
+      end)
+
+    if changes != %{} do
+      message = {:lobby_list, {:update_lobbies, changes}}
+      send_to_player!(message, state)
+    end
+
+    state = put_in(state.lobby_list_subscription.lobbies, lobbies)
+
+    {:noreply, state}
+  end
+
+  def handle_info(
+        %{
+          topic: "teiserver_tachyonlobby_list",
+          lobby_id: lobby_id
+        } = ev,
+        state
+      ) do
+    if state.lobby_list_subscription == nil do
+      {:noreply, state}
+    else
+      stale? =
+        with true <- ev.event != :remove_lobby,
+             lobby_state when lobby_state != nil <-
+               state.lobby_list_subscription.lobbies[lobby_id],
+             true <- lobby_state.counter >= ev.counter do
+          true
+        else
+          _nil_or_false -> false
+        end
+
+      if stale?, do: {:noreply, state}, else: do_handle_lobby_list_event(ev, state)
+    end
+  end
+
+  def do_handle_lobby_list_event(ev, %PT.Data{} = state) do
+    state =
+      case ev do
+        %{event: :add_lobby, overview: %LT.ListOverview{} = overview} ->
+          initial = %{counter: ev.counter, changes: Map.from_struct(overview)}
+          put_in(state.lobby_list_subscription.lobbies[ev.lobby_id], initial)
+
+        %{event: :update_lobby, changes: changes} ->
+          update_in(state.lobby_list_subscription.lobbies[ev.lobby_id], fn data ->
+            %{counter: ev.counter, changes: Map.merge(data.changes, changes)}
+          end)
+
+        %{event: :remove_lobby, lobby_id: lobby_id} ->
+          put_in(state.lobby_list_subscription.lobbies[lobby_id], %{
+            counter: -1,
+            changes: nil
+          })
+
+        _unknown ->
+          raise "Unknow lobby_list event: #{inspect(ev.event)} -- #{inspect(ev)}"
+      end
+
+    {:noreply, state}
+  end
+
+  defp via_tuple(user_id) do
+    SessionRegistry.via_tuple(user_id)
+  end
+
+  @spec build_self_state(PT.Data.t()) :: self_state()
+  defp build_self_state(%PT.Data{} = state) do
+    {current_party, invited_to} = get_party_states(state.party)
+
+    %{
+      party: current_party,
+      invited_to_parties: invited_to,
+      current_lobby: get_in(state.lobby.id),
+      current_battle: state.battle,
+      matchmaking: state.matchmaking
+    }
+  end
+
+  # assume all checks have been done, and make the current player join
+  # the specified queues, modifying the state accordingly and returning it
+  defp join_matchmaking(queues, %PT.Data{} = state) do
+    case join_all_queues(state.user.id, state.party.current_party, state.monitors, queues, []) do
+      {:ok, monitors, joined} ->
+        new_mm_state = {:searching, %PT.MmSearchingState{joined_queues: joined}}
+
+        new_state =
+          state
+          |> Map.replace!(:matchmaking, new_mm_state)
+          |> Map.replace!(:monitors, monitors)
+
+        {:ok, new_state}
+
+      {:error, err} ->
+        {:error, err}
+    end
+  end
+
+  @spec join_all_queues(
+          User.id(),
+          Party.id() | nil,
+          MC.t(),
+          [Matchmaking.queue_ref()],
+          [Matchmaking.queue_ref()]
+        ) ::
+          {:ok, MC.t(), [Matchmaking.queue_ref()]} | Matchmaking.join_error()
+  defp join_all_queues(_user_id, _party_id, monitors, [], joined), do: {:ok, monitors, joined}
+
+  defp join_all_queues(user_id, party_id, monitors, [to_join | rest], joined) do
+    {qid, version} = to_join
+
+    case Matchmaking.join_queue(qid, version, user_id, party_id) do
+      {:ok, queue_pid} ->
+        monitors = MC.monitor(monitors, queue_pid, {:mm_queue, to_join})
+        join_all_queues(user_id, party_id, monitors, rest, [to_join | joined])
+
+      # the `queue` message is all or nothing, so if joining a later queue need
+      # to leave the queues already joined
+      {:error, reason} ->
+        Enum.each(joined, fn {qid, _version} ->
+          Matchmaking.leave_queue(qid, user_id)
+          MC.demonitor_by_val(monitors, {:mm_queue, qid}, [:flush])
+        end)
+
+        {:error, reason}
+    end
+  end
+
+  defp leave_matchmaking(%PT.Data{} = state) do
+    case state.matchmaking do
+      :no_matchmaking ->
+        {{:error, :not_queued}, state}
+
+      {:searching, %PT.MmSearchingState{joined_queues: joined_queues}} ->
+        new_state = leave_all_queues(joined_queues, state)
+        {:ok, new_state}
+
+      {:pairing, %PT.MmPairingState{} = pairing_state} ->
+        monitors = MC.demonitor_by_val(state.monitors, :mm_room, [:flush])
+        queues_to_leave = [pairing_state.paired_queue | pairing_state.frozen_queues]
+        new_state = leave_all_queues(queues_to_leave, state)
+        {:ok, %{new_state | monitors: monitors}}
+    end
+  end
+
+  defp leave_all_queues(queues_to_leave, %PT.Data{} = state) do
+    # TODO tachyon_mvp: leaving queue ignore failure there.
+    # It is a bit unclear what kind of failure can happen, and also
+    # what should be done in that case
+    monitors =
+      Enum.reduce(queues_to_leave, state.monitors, fn
+        {qid, _version}, monitors ->
+          Matchmaking.leave_queue(qid, state.user.id)
+          MC.demonitor_by_val(monitors, {:mm_queue, qid}, [:flush])
+      end)
+
+    state
+    |> Map.replace!(:matchmaking, initial_matchmaking_state())
+    |> Map.replace!(:monitors, monitors)
+  end
+
+  defp send_to_player(state, message) do
+    # TODO tachyon_mvp: what should server do if the connection is down at that time?
+    # The best is likely to store it and send the notification upon reconnection
+    if state.conn_pid != nil do
+      send(state.conn_pid, message)
+    end
+
+    state
+  end
+
+  defp do_leave_party(%PT.Data{} = data) when is_nil(data.party.current_party),
+    do: {:error, :not_in_party}
+
+  defp do_leave_party(%PT.Data{} = data) do
+    case Party.leave_party(data.party.current_party, data.user.id) do
+      :ok ->
+        data =
+          data
+          |> put_in([Access.key!(:party), Access.key!(:current_party)], nil)
+          |> Map.update!(:monitors, &MC.demonitor_by_val(&1, :current_party))
+
+        {left_mm?, data} =
+          leave_matchmaking(data)
+
+        data =
+          if left_mm? == :ok,
+            do: send_to_player(data, {:matchmaking, {:cancelled, :party_user_left}}),
+            else: data
+
+        {:ok, data}
+
+      {:error, :not_a_member} ->
+        {:ok, %{data | party: %PT.PartyState{}}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec send_to_player!(term(), PT.Data.t()) :: :ok
+  defp send_to_player!(message, %PT.Data{} = state) do
+    # this is the same as send_to_player, but doesn't persist the message if
+    # there's no connection at that time.
+    # This should be used for messages where there's another way to recover
+    # state without having to rely on an interrupted stream of events.
+    # For example, player get full party state upon connection, so party events
+    # can be not persisted
+    if state.conn_pid != nil do
+      send(state.conn_pid, message)
+    end
+
+    :ok
+  end
+
+  defp do_subscribe_updates(subs, user) do
+    # PubSub.subscribe isn't idempotent, duplicate subscription result
+    # in duplicate messages being delivered
+    if !MapSet.member?(subs, user.id) do
+      topic = user_topic(user.id)
+      :ok = PubSub.subscribe(Teiserver.PubSub, topic)
+    end
+
+    case SessionRegistry.lookup(user.id) do
+      # player is offline, simulate the broadcast ourselves
+      nil ->
+        broadcast_user_update!(user, :offline)
+
+      # TODO: needs to store a monitor in the state to handle the case where the
+      # session dies before it can process this message.
+      pid ->
+        GenServer.cast(pid, {:user, :get_subscribe_state})
+    end
+  end
+
+  defp user_topic(%{id: id}), do: user_topic(id)
+  defp user_topic(user_id), do: "tachyon:user:#{user_id}"
+
+  defp broadcast_user_update!(user, status) do
+    topic = user_topic(user)
+
+    state = %{
+      user_id: user.id,
+      username: user.name,
+      # the user struct is a giant mess, where a bunch of stuff is added from
+      # "user stats data" and whatnot. We should refactor user access so that
+      # we get the same struct every time, possibly with nil values for some keys
+      # but in the meantime, just defensively get the country
+      country: Map.get(user, :country, "??"),
+      status: status,
+      roles: user.roles
+    }
+
+    PubSub.broadcast!(
+      Teiserver.PubSub,
+      topic,
+      # for now(?) we don't surface the `reconnecting` status. I think we'll revisit
+      # that because it's not a transparent state in term of capabilities:
+      # the player is "online" but cannot vote, reply, or anything really
+      %{
+        channel: topic,
+        event: :user_updated,
+        user_id: user.id,
+        state: state
+      }
+    )
+  end
+
+  # Gather the state of all relevant parties for the given session
+  defp get_party_states(party_state) do
+    ids = [
+      party_state.current_party | Enum.map(party_state.invited_to, fn {_version, id} -> id end)
+    ]
+
+    tasks =
+      Enum.map(ids, fn id ->
+        Task.async(fn ->
+          if id == nil do
+            nil
+          else
+            Party.get_overview(id)
+          end
+        end)
+      end)
+
+    [current | invited_to] = Task.await_many(tasks)
+    {current, invited_to}
+  end
+end

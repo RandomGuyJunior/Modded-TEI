@@ -1,0 +1,29 @@
+<% bsname = view_colour() %>
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <TeiserverWeb.Components.Admin.BadgeTypeComponents.section_menu
+          active="edit"
+          colour={bsname}
+        />
+
+        <hr />
+
+        {render(
+          "form.html",
+          Map.put(assigns, :action, ~p"/teiserver/admin/badge_types/#{@badge_type.id}")
+        )}
+
+        <hr />
+        {link(raw("<i class='far fa-fw fa-trash'></i> Delete"),
+          to: ~p"/teiserver/admin/badge_types/#{@badge_type.id}",
+          method: "delete",
+          data: [confirm: "Are you sure?"],
+          class: "btn btn-danger btn-outline"
+        )}
+      </div>
+    </div>
+  </div>
+</div>

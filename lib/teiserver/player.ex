@@ -1,0 +1,144 @@
+defmodule Teiserver.Player do
+  @moduledoc """
+  Context to handle anything player related when it comes to tachyon
+
+  This context essentially bundles two concepts: connection and session.
+  A connection is the actual websocket process that communicate with a player.
+  A session is a process that can be used to check whether a player is connected.
+  It is not directly linked to the websocket connection to allow more graceful
+  reconnection of player if/when they crash.
+  """
+
+  alias Teiserver.Account.User
+  alias Teiserver.Matchmaking
+  alias Teiserver.Party.Types, as: PartyTypes
+  alias Teiserver.Player
+  alias Teiserver.TachyonBattle
+
+  @doc """
+  Returns the pid of the session registered with a given user id
+  """
+  @spec lookup_session(User.id()) :: pid() | nil
+  defdelegate lookup_session(user_id), to: Player.SessionRegistry, as: :lookup
+
+  @doc """
+  Returns the pid of the connection registered with a given user id
+  """
+  @spec lookup_connection(User.id()) :: pid() | nil
+  defdelegate lookup_connection(user_id), to: Player.Registry, as: :lookup
+
+  @spec connection_via_tuple(User.id()) :: GenServer.name()
+  defdelegate connection_via_tuple(user_id), to: Player.Registry, as: :via_tuple
+
+  defdelegate restore_sessions(), to: Player.Session
+
+  @doc """
+  To be used when a process is interested in the presence of a given player.
+  """
+  @spec monitor_session(User.id()) :: reference() | nil
+  def monitor_session(user_id) do
+    pid = lookup_session(user_id)
+
+    if is_nil(pid) do
+      nil
+    else
+      Process.monitor(pid)
+    end
+  end
+
+  @spec conn_state(User.id()) :: Player.Session.conn_state()
+  defdelegate conn_state(user_id), to: Player.Session
+
+  @doc """
+  When a queued player is matched with other, need to let them know
+  """
+  @spec matchmaking_notify_found(User.id(), Matchmaking.queue_id(), pid(), timeout()) :: :ok
+  defdelegate matchmaking_notify_found(user_id, queue_id, room_pid, timeout_ms),
+    to: Player.Session
+
+  @doc """
+  When a pairing fails because one of the player declines the pairing or leaves
+  the queues
+  """
+  @spec matchmaking_notify_lost(User.id(), Matchmaking.lost_reason()) :: :ok
+  defdelegate matchmaking_notify_lost(user_id, reason), to: Player.Session
+
+  @spec matchmaking_notify_cancelled(User.id(), Matchmaking.cancelled_reason()) :: :ok
+  defdelegate matchmaking_notify_cancelled(user_id, reason), to: Player.Session
+
+  @doc """
+  To send the notification as players ready up for a pairing
+  """
+  @spec matchmaking_found_update(User.id(), non_neg_integer(), pid()) :: :ok
+  defdelegate matchmaking_found_update(user_id, ready_count, room_pid), to: Player.Session
+
+  @doc """
+  Leave all the queues, and effectively removes the player from any matchmaking
+  """
+  @spec matchmaking_leave_queues(User.id()) :: Matchmaking.leave_result()
+  defdelegate matchmaking_leave_queues(user_id), to: Player.Session, as: :leave_queues
+
+  @type start_data :: Player.Session.start_data()
+
+  @doc """
+  It's go time! the player should join a game
+  """
+  @spec battle_start(User.id(), {TachyonBattle.id(), pid()}, start_data(), password :: String.t()) ::
+          :ok
+  defdelegate battle_start(user_id, battle_id, battle_start_data, password), to: Player.Session
+
+  @doc """
+  Let the player know that they can join a battle associated with a lobby
+  """
+  @spec lobby_join_battle(
+          User.id(),
+          {TachyonBattle.id(), pid()},
+          start_data(),
+          password :: String.t()
+        ) ::
+          :ok
+  defdelegate lobby_join_battle(user_id, battle_data, battle_start_data, password),
+    to: Player.Session
+
+  defdelegate notify_left_lobby(user_id, lobby_id, reason), to: Player.Session
+
+  @doc """
+  Let the player know they've been invited to a party
+  """
+  defdelegate party_notify_invited(user_id, party_state), to: Player.Session
+
+  @doc """
+  Let the player know about the new state of a party they're a member of, or
+  have been invited to.
+  """
+  defdelegate party_notify_updated(user_id, party_state), to: Player.Session
+
+  @doc """
+  Let the player know that they are no longer invited/member of the party
+  """
+  @spec party_notify_removed(User.id(), PartyTypes.Overview.t()) :: :ok
+  defdelegate party_notify_removed(user_id, party_state), to: Player.Session
+
+  @doc """
+  notify the player that the party it is currently a member of just entered
+  matchmaking and it should join the specified queues.
+  """
+  @spec party_notify_join_queues(
+          User.id(),
+          [{Matchmaking.queue_id(), version :: String.t()}],
+          PartyTypes.Overview.t()
+        ) :: :ok
+  defdelegate party_notify_join_queues(user_id, queues, party_state), to: Player.Session
+
+  @doc """
+  Sends a user/self event to a user when their roles are updated
+  """
+  @spec update_user_roles(User.id(), [String.t()]) :: :ok
+  defdelegate update_user_roles(user_id, roles), to: Player.Session
+
+  @doc """
+  How many players are currently connected?
+  """
+  @spec connected_count() :: non_neg_integer()
+  defdelegate connected_count(), to: Player.Registry
+end

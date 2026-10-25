@@ -1,0 +1,107 @@
+defmodule TeiserverWeb.AdminDashLive.LoginThrottle do
+  @moduledoc false
+  alias Phoenix.PubSub
+  alias Teiserver
+  alias Teiserver.Admin.AdminLib
+
+  use TeiserverWeb, :live_view
+
+  @impl Phoenix.LiveView
+  def mount(_params, session, socket) do
+    :ok = PubSub.subscribe(Teiserver.PubSub, "teiserver_liveview_login_throttle")
+
+    socket =
+      socket
+      |> AuthPlug.live_call(session)
+      |> add_breadcrumb(name: "Admin", url: ~p"/admin")
+      |> add_breadcrumb(name: "Dashboard", url: ~p"/admin/dashboard")
+      |> add_breadcrumb(name: "Login throttle", url: ~p"/admin/dashboard/login_throttle")
+      |> assign(:site_menu_active, "admin")
+      |> assign(:view_colour, AdminLib.colours())
+      |> assign(:heartbeats, %{})
+      |> assign(:queues, nil)
+      |> assign(:recent_logins, [])
+      |> assign(:arrival_times, %{})
+      |> assign(:remaining_capacity, 0)
+      |> assign(:awaiting_release, nil)
+
+    :timer.send_interval(5_000, :tick)
+
+    {:ok, socket}
+  end
+
+  @impl Phoenix.LiveView
+  def handle_params(_params, _url, socket) do
+    case allow?(socket.assigns[:current_user], "teiserver.staff.server") do
+      true ->
+        {:noreply, socket}
+
+      false ->
+        {:noreply,
+         socket
+         |> redirect(to: ~p"/")}
+    end
+  end
+
+  @impl Phoenix.LiveView
+  def handle_info(:tick, socket) do
+    {
+      :noreply,
+      socket
+    }
+  end
+
+  def handle_info(%{channel: "teiserver_liveview_login_throttle", event: :tick} = msg, state) do
+    {:noreply,
+     state
+     |> assign(:heartbeats, msg.heartbeats)
+     |> assign(:queues, msg.queues)
+     |> assign(:recent_logins, msg.recent_logins)}
+  end
+
+  def handle_info(
+        %{channel: "teiserver_liveview_login_throttle", event: :released_users} = _msg,
+        %{assigns: _assigns} = state
+      ) do
+    # new_heartbeats = Map.drop(assigns.heartbeats, [msg.userid])
+    # new_arrival_times = Map.drop(assigns.arrival_times, [msg.userid])
+
+    {
+      :noreply,
+      state
+      # |> assign(:heartbeats, new_heartbeats)
+      # |> assign(:arrival_times, new_arrival_times)
+    }
+  end
+
+  def handle_info(
+        %{channel: "teiserver_liveview_login_throttle", event: :updated_capacity} = msg,
+        state
+      ) do
+    {:noreply,
+     state
+     |> assign(:remaining_capacity, msg.remaining_capacity)}
+  end
+
+  def handle_info(%{channel: "teiserver_liveview_login_throttle", event: :release} = msg, state) do
+    {:noreply,
+     state
+     |> assign(:remaining_capacity, msg.remaining_capacity)
+     |> assign(:awaiting_release, msg.awaiting_release)}
+  end
+
+  def handle_info(
+        %{channel: "teiserver_liveview_login_throttle", event: :accept_login} = msg,
+        state
+      ) do
+    {:noreply,
+     state
+     |> assign(:remaining_capacity, msg.remaining_capacity)
+     |> assign(:recent_logins, msg.recent_logins)}
+  end
+
+  @impl Phoenix.LiveView
+  def handle_event("disconnect-all-bots", _event, socket) do
+    {:noreply, socket}
+  end
+end

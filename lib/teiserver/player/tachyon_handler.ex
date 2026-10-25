@@ -1,0 +1,1542 @@
+defmodule Teiserver.Player.TachyonHandler do
+  @moduledoc """
+  Player specific code to handle tachyon logins and actions
+  """
+
+  alias Teiserver.Account
+  alias Teiserver.Account.User
+  alias Teiserver.CacheUser
+  alias Teiserver.Data.Types, as: T
+  alias Teiserver.Helpers.BurstyRateLimiter
+  alias Teiserver.Helpers.Collections
+  alias Teiserver.Helpers.TachyonParser
+  alias Teiserver.Matchmaking
+  alias Teiserver.Messaging
+  alias Teiserver.Party.Types, as: PartyTypes
+  alias Teiserver.Player
+  alias Teiserver.Player.LoginQueue
+  alias Teiserver.Player.Registry
+  alias Teiserver.Player.Session
+  alias Teiserver.Player.SessionRegistry
+  alias Teiserver.Player.SessionSupervisor
+  alias Teiserver.Player.Types, as: PT
+  alias Teiserver.Tachyon.Handler
+  alias Teiserver.Tachyon.Schema
+  alias Teiserver.TachyonLobby.Types, as: LT
+
+  require Logger
+
+  @behaviour Handler
+
+  @type state ::
+          %{
+            user: T.user(),
+            status: :waiting
+          }
+          | %{
+              user: T.user(),
+              status: :admitted,
+              sess_monitor: reference(),
+              pending_responses: Handler.pending_responses()
+            }
+
+  @impl Handler
+  def connect(conn) do
+    lobby_client = conn.assigns[:token].application.uid
+    user = conn.assigns[:token].owner
+
+    with addr when is_list(addr) <- :inet.ntoa(conn.remote_ip),
+         {:ok, user} <- CacheUser.tachyon_login(user, to_string(addr), lobby_client) do
+      {:ok, %{user: user}}
+    else
+      {:error, :einval} ->
+        {:error, 404, "Invalid remote address"}
+
+      {:error, :rate_limited, msg} ->
+        {:error, 429, msg}
+
+      {:error, msg} ->
+        {:error, 403, msg}
+    end
+  end
+
+  @impl Handler
+  @spec init(%{user: T.user()}) :: Handler.result()
+  def init(initial_state) do
+    user = initial_state.user
+    Logger.metadata(actor_type: :connection, actor_id: to_string(user.id))
+
+    cond do
+      Player.lookup_session(user.id) != nil ->
+        do_admit(initial_state)
+
+      LoginQueue.attempt_login(user.id) ->
+        do_admit(initial_state)
+
+      true ->
+        state = Map.put(initial_state, :status, :waiting)
+        {:ok, state}
+    end
+  end
+
+  defp do_admit(state) do
+    {:ok, session_pid, sess_state} = setup_session(state.user)
+    sess_monitor = Process.monitor(session_pid)
+
+    new_state =
+      state
+      |> Map.put(:status, :admitted)
+      |> Map.put(:sess_monitor, sess_monitor)
+      |> Map.put(:pending_responses, Map.get(state, :pending_responses, %{}))
+
+    event = build_user_self_event(state.user, sess_state)
+    {:event, "user/self", event, new_state}
+  end
+
+  @doc """
+  Notify the connection handler that login has been accepted and admission can proceed.
+  Called by `LoginQueue` when a slot opens for a queued player.
+  """
+  def notify_login_accepted(pid) when is_pid(pid) do
+    send(pid, :login_accepted)
+  end
+
+  def force_disconnect(nil), do: :ok
+
+  def force_disconnect(pid) when is_pid(pid) do
+    send(pid, :force_disconnect)
+  end
+
+  @impl Handler
+  def init_rate_limiter(_state) do
+    BurstyRateLimiter.per_second(10) |> BurstyRateLimiter.with_burst(20)
+  end
+
+  @impl Handler
+  def handle_info(:login_accepted, state) do
+    do_admit(state)
+  end
+
+  def handle_info({:DOWN, _ref, :process, _pid, reason}, state) do
+    Logger.warning(
+      "Session for player went down because #{inspect(reason)}, terminating connection"
+    )
+
+    {:stop, :normal,
+     {1008, "Server error: session process exited with reason #{inspect(reason)}"}, state}
+  end
+
+  def handle_info({:matchmaking, {:notify_found, queue_id, timeout_ms}}, state) do
+    resp = %{
+      queueId: queue_id,
+      timeoutMs: timeout_ms
+    }
+
+    {:event, "matchmaking/found", resp, state}
+  end
+
+  def handle_info({:matchmaking, {:found_update, ready_count}}, state) do
+    resp = %{
+      readyCount: ready_count
+    }
+
+    {:event, "matchmaking/foundUpdate", resp, state}
+  end
+
+  def handle_info({:matchmaking, :notify_lost}, state) do
+    {:event, "matchmaking/lost", state}
+  end
+
+  def handle_info({:matchmaking, {:cancelled, reason}}, state) do
+    data =
+      case reason do
+        :cancel -> %{reason: :intentional}
+        :timeout -> %{reason: :ready_timeout}
+        {:server_error, details} -> %{reason: :server_error, details: details}
+        err -> %{reason: err}
+      end
+
+    {:event, "matchmaking/cancelled", data, state}
+  end
+
+  def handle_info({:matchmaking, {:queues_joined, queues}}, state) do
+    data = %{queues: queues}
+    {:event, "matchmaking/queuesJoined", data, state}
+  end
+
+  def handle_info({:battle_start, %PT.BattleState{} = battle_state}, state) do
+    data = battle_state_to_tachyon(battle_state)
+
+    {:request, "battle/start", data, [], state}
+  end
+
+  def handle_info({:messaging, {:received, message}}, state) do
+    {:event, "messaging/received", message_to_tachyon(message), state}
+  end
+
+  def handle_info({:friend, {:request_received, from_id}}, state) do
+    {:event, "friend/requestReceived", %{from: to_string(from_id)}, state}
+  end
+
+  def handle_info({:friend, {:request_cancelled, from_id}}, state) do
+    {:event, "friend/requestCancelled", %{from: to_string(from_id)}, state}
+  end
+
+  def handle_info({:friend, {:request_accepted, from_id}}, state) do
+    {:event, "friend/requestAccepted", %{from: to_string(from_id)}, state}
+  end
+
+  def handle_info({:friend, {:request_rejected, from_id}}, state) do
+    {:event, "friend/requestRejected", %{from: to_string(from_id)}, state}
+  end
+
+  def handle_info({:friend, {:removed, from_id}}, state) do
+    {:event, "friend/removed", %{from: to_string(from_id)}, state}
+  end
+
+  def handle_info({:user, {:user_updated, user_state}}, state) do
+    event = %{
+      users: [
+        %{
+          userId: to_string(user_state.user_id),
+          username: user_state.username,
+          displayName: user_state.username,
+          clanId: nil,
+          country: user_state.country,
+          status: user_state.status,
+          roles: roles_to_tachyon(user_state.roles)
+        }
+      ]
+    }
+
+    {:event, "user/updated", event, state}
+  end
+
+  def handle_info({:user, {:role_updated, roles, sess_state}}, state) do
+    event = build_user_self_event(%{state.user | roles: roles}, sess_state)
+    {:event, "user/self", event, state}
+  end
+
+  def handle_info({:party, {:invited, %PartyTypes.Overview{} = party_state}}, state) do
+    event = %{party: party_state_to_tachyon(party_state)}
+    {:event, "party/invited", event, state}
+  end
+
+  def handle_info({:party, {:updated, %PartyTypes.Overview{} = party_state}}, state) do
+    event = party_state_to_tachyon(party_state)
+    {:event, "party/updated", event, state}
+  end
+
+  def handle_info({:party, {:removed, party_id}}, state) do
+    event = %{partyId: party_id}
+    {:event, "party/removed", event, state}
+  end
+
+  def handle_info({:lobby, lobby_id, {:updated, update}}, state) do
+    data = lobby_update_to_tachyon(lobby_id, update)
+
+    if data != %{},
+      do: {:event, "lobby/updated", data, state},
+      else: {:ok, state}
+  end
+
+  def handle_info({:lobby, _lobby_id, {:vote_ended, vote_id, outcome}}, state) do
+    data = %{id: vote_id, outcome: outcome}
+    {:event, "lobby/voteEnded", data, state}
+  end
+
+  def handle_info({:lobby, lobby_id, {:left, reason}}, state) do
+    data =
+      case reason do
+        :kicked ->
+          %{id: lobby_id, reason: "kicked"}
+
+        {:error, msg} ->
+          %{id: lobby_id, reason: msg}
+
+        {:banned, dt} ->
+          %{id: lobby_id, reason: "banned", bannedUntil: DateTime.to_unix(dt, :microsecond)}
+      end
+
+    {:event, "lobby/left", data, state}
+  end
+
+  def handle_info({:lobby_list, {:update_lobbies, changes}}, state) do
+    data = %{
+      lobbies:
+        Enum.map(changes, fn {id, change} ->
+          {id, lobby_overview_to_tachyon(id, change)}
+        end)
+        |> Enum.into(%{})
+    }
+
+    {:event, "lobby/listUpdated", data, state}
+  end
+
+  def handle_info({:timeout, message_id}, state)
+      when is_map_key(state.pending_responses, message_id) do
+    Logger.debug("User did not reply in time to request with id #{message_id}")
+    {:stop, :normal, state}
+  end
+
+  def handle_info(:force_disconnect, state) do
+    # TODO: send a proper tachyon message to inform the client it is getting disconnected
+    {:stop, :normal, state}
+  end
+
+  def handle_info({:EXIT, _pid, :shutdown}, state) do
+    # TODO: send a proper tachyon message to inform the client it is getting disconnected
+    {:stop, :normal, state}
+  end
+
+  def handle_info(msg, state) do
+    Logger.warning("unhandled info message: #{inspect(msg)}")
+    {:ok, state}
+  end
+
+  @impl Handler
+  @spec handle_command(
+          Schema.command_id(),
+          Schema.message_type(),
+          Schema.message_id(),
+          term(),
+          state()
+        ) :: WebSock.handle_result()
+  def handle_command(
+        _command_id,
+        _message_type,
+        _message_id,
+        _message,
+        %{status: :waiting} = state
+      ) do
+    {:error_response, :invalid_request, "waiting for login", state}
+  end
+
+  def handle_command("system/disconnect", "request", _message_id, _message, state) do
+    Session.disconnect(state.user.id)
+
+    {:stop, :normal, state}
+  end
+
+  def handle_command("system/serverStats", "request", _message_id, _message, state) do
+    user_count = SessionRegistry.count()
+
+    {:response, %{userCount: user_count}, state}
+  end
+
+  def handle_command("matchmaking/list", "request", _message_id, _message, state) do
+    queues =
+      Matchmaking.list_queues()
+      |> Enum.map(fn {qid, queue} ->
+        game_names = Enum.map(queue.games, fn game -> %{springName: game.spring_game} end)
+        map_names = Enum.map(queue.maps, fn map -> %{springName: map.spring_name} end)
+
+        %{
+          id: qid,
+          version: queue.version,
+          name: queue.name,
+          numOfTeams: queue.team_count,
+          teamSize: queue.team_size,
+          ranked: queue.ranked,
+          engines: queue.engines,
+          games: game_names,
+          maps: map_names
+        }
+      end)
+
+    {:response, %{playlists: queues}, state}
+  end
+
+  def handle_command("matchmaking/queue", "request", _message_id, message, state) do
+    queues =
+      Enum.map(message["data"]["queues"], fn x -> {x["id"], x["version"]} end)
+
+    case Session.join_queues(state.user.id, queues) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} ->
+        case reason do
+          :invalid_queue ->
+            {:error_response, :invalid_queue_specified, state}
+
+          :version_mismatch ->
+            {:error_response, :version_mismatch, state}
+
+          :too_many_players ->
+            {:error_response, :invalid_request, "too many player for a playlist", state}
+
+          :missing_engines ->
+            {:error_response, :internal_error, "missing engine list", state}
+
+          :missing_games ->
+            {:error_response, :internal_error, "missing game list", state}
+
+          :missing_maps ->
+            {:error_response, :internal_error, "missing map list", state}
+
+          :party_too_big ->
+            {:error_response, :invalid_request, "party too big", state}
+
+          x ->
+            {:error_response, x, state}
+        end
+    end
+  end
+
+  def handle_command("matchmaking/cancel", "request", _message_id, _message, state) do
+    case Session.leave_queues(state.user.id) do
+      :ok ->
+        {:response, {nil, [Schema.event("matchmaking/cancelled", %{reason: :intentional})]},
+         state}
+
+      {:error, reason} ->
+        {:error_response, reason, state}
+    end
+  end
+
+  def handle_command("matchmaking/ready", "request", _message_id, _message, state) do
+    case Session.matchmaking_ready(state.user.id) do
+      :ok -> {:response, state}
+      {:error, :no_match} -> {:error_response, :no_match, state}
+    end
+  end
+
+  def handle_command("messaging/send", "request", _message_id, msg, state) do
+    case message_target_from_tachyon(msg["data"]["target"]) do
+      {:ok, target} ->
+        case target do
+          {:player, _user_id} ->
+            msg =
+              Messaging.new(
+                msg["data"]["message"],
+                {:player, state.user.id},
+                :erlang.monotonic_time(:micro_seconds)
+              )
+
+            case Messaging.send(msg, target) do
+              :ok -> {:response, state}
+              {:error, :invalid_recipient} -> {:error_response, :invalid_target, state}
+            end
+
+          :party ->
+            case Session.send_party_message(state.user.id, msg["data"]["message"]) do
+              :ok -> {:response, state}
+              {:error, reason} -> {:error_response, :invalid_request, inspect(reason), state}
+            end
+
+          :lobby ->
+            case Session.send_lobby_message(state.user.id, msg["data"]["message"]) do
+              :ok -> {:response, state}
+              {:error, reason} -> {:error_response, :invalid_request, inspect(reason), state}
+            end
+        end
+
+      {:error, :invalid_recipient} ->
+        {:error_response, :invalid_target, state}
+    end
+  end
+
+  def handle_command("messaging/subscribeReceived", "request", _message_id, msg, state) do
+    since = parse_since(msg["data"]["since"])
+
+    {:ok, has_missed_messages, msg_to_send} =
+      Session.subscribe_received(state.user.id, since)
+
+    response = %{hasMissedMessages: has_missed_messages}
+
+    msg_to_send =
+      Enum.map(msg_to_send, fn msg ->
+        Schema.event("messaging/received", message_to_tachyon(msg))
+      end)
+
+    {:response, {response, msg_to_send}, state}
+  end
+
+  def handle_command("user/info", "request", _message_id, msg, state) do
+    user_id = msg["data"]["userId"]
+    user = Account.deprecated_get_user_by_id(user_id)
+    db_user = Account.get_user(user_id)
+
+    if user != nil do
+      %{status: status} = Session.get_user_info(user.id)
+
+      resp =
+        %{
+          userId: to_string(user.id),
+          username: user.name,
+          displayName: user.name,
+          clanId: nil,
+          countryCode: user.country,
+          status: status,
+          roles: roles_to_tachyon(db_user.roles)
+        }
+
+      {:response, resp, state}
+    else
+      {:error_response, :unknown_user, state}
+    end
+  end
+
+  def handle_command("friend/list", "request", _message_id, _msg, state) do
+    {friends, incoming, outgoing} = get_user_friends(state.user.id)
+
+    resp = %{
+      friends: friends,
+      incomingPendingRequests: incoming,
+      outgoingPendingRequests: outgoing
+    }
+
+    {:response, resp, state}
+  end
+
+  def handle_command("friend/sendRequest", "request", _message_id, msg, state) do
+    with {:ok, target} <- get_user(msg["data"]["to"]),
+         {:ok, data} <- Account.create_friend_request(state.user.id, target.id) do
+      case data do
+        %Account.FriendRequest{} ->
+          Session.friend_request_received(target.id, state.user.id)
+
+        :auto_accepted ->
+          Session.friend_request_accepted(target.id, state.user.id)
+          Session.friend_request_accepted(state.user.id, target.id)
+      end
+
+      {:response, state}
+    else
+      {:error, :invalid_user} ->
+        {:error_response, :invalid_user, state}
+
+      {:error, :already_in_friendlist} ->
+        {:error_response, :already_in_friendlist, state}
+
+      {:error, :outgoing_capacity_reached} ->
+        {:error_response, :outgoing_capacity_reached, state}
+
+      {:error, :incoming_capacity_reached} ->
+        {:error_response, :incoming_capacity_reached, state}
+
+      err ->
+        Logger.error("cannot create friend request #{inspect(err)}")
+        {:error_response, :internal_error, state}
+    end
+  end
+
+  def handle_command("friend/acceptRequest", "request", _message_id, msg, state) do
+    with {:ok, originator_id} <- TachyonParser.parse_user_id(msg["data"]["from"]),
+         :ok <- Account.accept_friend_request(originator_id, state.user.id) do
+      Session.friend_request_accepted(originator_id, state.user.id)
+      {:response, state}
+    else
+      {:error, :invalid_id} ->
+        {:error_response, :invalid_user, state}
+
+      {:error, "no request"} ->
+        {:error_response, :no_pending_request, state}
+    end
+  end
+
+  def handle_command("friend/rejectRequest", "request", _message_id, msg, state) do
+    with {:ok, originator_id} <- TachyonParser.parse_user_id(msg["data"]["from"]),
+         :ok <- Account.decline_friend_request(originator_id, state.user.id) do
+      Session.friend_request_rejected(originator_id, state.user.id)
+      {:response, state}
+    else
+      {:error, :invalid_id} ->
+        {:error_response, :invalid_user, state}
+
+      {:error, "no request"} ->
+        {:error_response, :no_pending_request, state}
+
+      err ->
+        Logger.error("Unhandled error in rejectRequest: #{inspect(err)}")
+
+        {:error_response, :internal_error, inspect(err), state}
+    end
+  end
+
+  def handle_command("friend/cancelRequest", "request", _message_id, msg, state) do
+    with {:ok, target_id} <- TachyonParser.parse_user_id(msg["data"]["to"]),
+         :ok <- Account.rescind_friend_request(state.user.id, target_id) do
+      Session.friend_request_cancelled(target_id, state.user.id)
+      {:response, state}
+    else
+      {:error, "no request"} ->
+        {:response, state}
+
+      _other ->
+        {:error_response, :invalid_user, state}
+    end
+  end
+
+  def handle_command("friend/remove", "request", _message_id, msg, state) do
+    with {:ok, target_id} <- TachyonParser.parse_user_id(msg["data"]["userId"]),
+         %Account.Friend{} = friend <- Account.get_friend(state.user.id, target_id),
+         {:ok, _changeset} <- Account.delete_friend(friend) do
+      Session.friend_removed(target_id, state.user.id)
+      {:response, state}
+    else
+      nil ->
+        {:response, state}
+
+      {:error, :invalid_id} ->
+        {:error_response, :invalid_user, state}
+
+      err ->
+        Logger.error("can't remove friend #{inspect(err)}")
+        {:error_response, :internal_error, inspect(err), state}
+    end
+  end
+
+  def handle_command("user/subscribeUpdates", "request", _message_id, msg, state) do
+    {ok_ids, invalid_ids} = TachyonParser.parse_user_ids(msg["data"]["userIds"])
+
+    if Enum.empty?(invalid_ids) do
+      case Session.subscribe_updates(state.user.id, ok_ids) do
+        :ok ->
+          {:response, state}
+
+        {:error, {:invalid_ids, invalid_ids}} ->
+          details = "invalid user ids: #{Enum.join(invalid_ids, ", ")}"
+          {:error_response, :invalid_request, details, state}
+      end
+    else
+      details = "invalid user ids: #{Enum.join(invalid_ids, ", ")}"
+      {:error_response, :invalid_request, details, state}
+    end
+  end
+
+  def handle_command("user/unsubscribeUpdates", "request", _message_id, msg, state) do
+    {ok_ids, invalid_ids} = TachyonParser.parse_user_ids(msg["data"]["userIds"])
+
+    if Enum.empty?(invalid_ids) do
+      case Session.unsubscribe_updates(state.user.id, ok_ids) do
+        :ok ->
+          {:response, state}
+
+        {:error, {:invalid_ids, invalid_ids}} ->
+          details = "invalid user ids: #{Enum.join(invalid_ids, ", ")}"
+          {:error_response, :invalid_request, details, state}
+      end
+    else
+      details = "invalid user ids: #{Enum.join(invalid_ids, ", ")}"
+      {:error_response, :invalid_request, details, state}
+    end
+  end
+
+  def handle_command("party/create", "request", _message_id, _msg, state) do
+    case Session.create_party(state.user.id) do
+      {:ok, party_state} ->
+        data = %{party: party_state_to_tachyon(party_state)}
+        {:response, data, state}
+
+      {:error, :already_in_party} ->
+        {:error_response, :invalid_request, "Already in a party", state}
+
+      {:error, reason} ->
+        {:error_response, :internal_error, inspect(reason), state}
+    end
+  end
+
+  def handle_command("party/leave", "request", _message_id, _msg, state) do
+    case Session.leave_party(state.user.id) do
+      :ok ->
+        {:response, state}
+
+      {:error, :not_in_party} ->
+        {:error_response, :invalid_request, "Not in a party", state}
+
+      {:error, :invalid_party} ->
+        {:error_response, :invalid_request, "Invalid party", state}
+
+      {:error, reason} ->
+        {:error_response, :internal_error, inspect(reason), state}
+    end
+  end
+
+  def handle_command("party/invite", "request", _message_id, msg, state) do
+    raw_user_id = msg["data"]["userId"]
+
+    with {:ok, id} <- TachyonParser.parse_user_id(raw_user_id),
+         :ok <- Session.invite_to_party(state.user.id, id) do
+      {:response, state}
+    else
+      {:error, reason} when reason in [:invalid_player, :invalid_user] ->
+        {:error_response, :invalid_request,
+         "User with id #{raw_user_id} isn't valid or connected", state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, inspect(reason), state}
+    end
+  end
+
+  def handle_command("party/acceptInvite", "request", _message_id, msg, state) do
+    party_id = msg["data"]["partyId"]
+
+    case Session.accept_invite_to_party(state.user.id, party_id) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, inspect(reason), state}
+    end
+  end
+
+  def handle_command("party/declineInvite", "request", _message_id, msg, state) do
+    party_id = msg["data"]["partyId"]
+
+    case Session.decline_invite_to_party(state.user.id, party_id) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, inspect(reason), state}
+    end
+  end
+
+  def handle_command("party/cancelInvite", "request", _message_id, msg, state) do
+    with {:ok, user_id} <- TachyonParser.parse_user_id(msg["data"]["userId"]),
+         :ok <- Session.cancel_invite_to_party(state.user.id, user_id) do
+      {:response, state}
+    else
+      {:error, reason} ->
+        {:error_response, :invalid_request, inspect(reason), state}
+    end
+  end
+
+  def handle_command("party/kickMember", "request", _message_id, msg, state) do
+    with {:ok, target_id} <- TachyonParser.parse_user_id(msg["data"]["userId"]),
+         :ok <- Session.kick_party_member(state.user.id, target_id) do
+      {:response, state}
+    else
+      {:error, reason} ->
+        {:error_response, :invalid_request, inspect(reason), state}
+    end
+  end
+
+  def handle_command("lobby/create", "request", _msg_id, msg, state) do
+    # TODO: the `lobby/update` has very similar logic. There should be a way
+    # to combine the parsing
+    create_data = %PT.LobbyStartParams{
+      name: msg["data"]["name"],
+      map_name: msg["data"]["mapName"],
+      ally_team_config:
+        for at <- msg["data"]["allyTeamConfig"] do
+          sb = at["startBox"]
+          teams = for t <- at["teams"], do: %{max_players: t["maxPlayers"]}
+
+          %LT.AllyTeamConfig{
+            max_teams: at["maxTeams"],
+            start_box: %{
+              top: sb["top"],
+              bottom: sb["bottom"],
+              left: sb["left"],
+              right: sb["right"]
+            },
+            teams: teams
+          }
+        end,
+      boss_enabled?: msg["data"]["areBossesEnabled"],
+      game_options:
+        Map.get(msg["data"], "gameOptions", %{})
+        |> Enum.map(fn {k, v} -> {k, v["value"]} end)
+        |> Enum.into(%{}),
+      tags: Map.get(msg["data"], "tags", %{})
+    }
+
+    case Session.create_lobby(state.user.id, create_data) do
+      {:ok, details} ->
+        data = lobby_details_to_tachyon(details)
+
+        {:response, data, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/join", "request", _msg_id, msg, state) do
+    case Session.lobby_join(state.user.id, msg["data"]["id"]) do
+      {:ok, details} ->
+        data = lobby_details_to_tachyon(details)
+        {:response, data, state}
+
+      {:error, :lobby_full} ->
+        {:error_response, :lobby_full, state}
+
+      {:error, :banned, ban_until} ->
+        details = "Banned until #{DateTime.to_iso8601(ban_until)}"
+        {:error_response, :banned, details, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/leave", "request", _msg_id, _msg, state) do
+    case Session.lobby_leave(state.user.id) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/joinAllyTeam", "request", _msg_id, msg, state) do
+    with {:ok, ally_team} <- TachyonParser.parse_int(msg["data"]["allyTeam"]),
+         :ok <- Session.lobby_join_ally_team(state.user.id, ally_team) do
+      {:response, state}
+    else
+      {:error, :invalid_int} ->
+        {:error_response, :invalid_request, "Invalid ally team", state}
+
+      {:error, reason} when reason in [:not_in_lobby, :ally_team_full] ->
+        {:error_response, reason, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/spectate", "request", _msg_id, _msg, state) do
+    case Session.lobby_spectate(state.user.id) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} when reason in [:not_in_lobby] ->
+        {:error_response, reason, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/joinQueue", "request", _msg_id, _msg, state) do
+    case Session.lobby_join_queue(state.user.id) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} when reason in [:not_in_lobby] ->
+        {:error_response, reason, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/addBot", "request", _msg_id, %{"data" => data}, state) do
+    opts =
+      [{:name, data["name"]}, {:version, data["version"]}, {:options, data["options"]}]
+      |> Enum.filter(&(elem(&1, 1) != nil))
+
+    with {:ok, ally_team} <- TachyonParser.parse_int(data["allyTeam"]),
+         {:ok, bot_id} <-
+           Session.lobby_add_bot(state.user.id, ally_team, data["shortName"], opts) do
+      {:response, %{id: bot_id}, state}
+    else
+      {:error, :invalid_int} ->
+        {:error_response, :invalid_request, "Invalid ally team", state}
+
+      {:error, reason} when reason in [:not_in_lobby, :ally_team_full] ->
+        {:error_response, reason, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/removeBot", "request", _msg_id, msg, state) do
+    case Session.lobby_remove_bot(state.user.id, msg["data"]["id"]) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} when reason in [:not_in_lobby, :invalid_bot] ->
+        {:error_response, reason, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/updateBot", "request", _msg_id, %{"data" => data}, state) do
+    keys = [
+      {"name", :name},
+      {"shortName", :short_name},
+      {"version", :version},
+      {"options", :options}
+    ]
+
+    update_data =
+      Enum.reduce(keys, %{id: data["id"]}, fn {tk, k}, m ->
+        if is_map_key(data, tk) do
+          Map.put(m, k, Map.get(data, tk))
+        else
+          m
+        end
+      end)
+
+    case Session.lobby_update_bot(state.user.id, update_data) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} when reason in [:not_in_lobby, :invalid_bot] ->
+        {:error_response, reason, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/update", "request", _msg_id, %{"data" => data}, state) do
+    mappings = %{
+      "name" => :name,
+      "mapName" => :map_name,
+      "allyTeamConfig" =>
+        {:ally_team_config, LT.AllyTeamConfig,
+         %{
+           "maxTeams" => :max_teams,
+           "startBox" =>
+             {:start_box,
+              %{"top" => :top, "bottom" => :bottom, "left" => :left, "right" => :right}},
+           "teams" => {:teams, %{"maxPlayers" => :max_players}}
+         }},
+      "gameOptions" =>
+        {:game_options,
+         fn opts ->
+           Enum.map(opts, fn {k, v} -> {k, v["value"]} end) |> Enum.into(%{})
+         end},
+      "tags" => :tags
+    }
+
+    update_data = Collections.transform_map(data, mappings)
+
+    case Session.lobby_update_properties(state.user.id, update_data) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/voteSubmit", "request", _msg_id, %{"data" => data}, state) do
+    result =
+      Session.lobby_vote_submit(
+        state.user.id,
+        data["id"],
+        String.to_existing_atom(data["vote"])
+      )
+
+    case result do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/appointBoss", "request", _msg_id, %{"data" => data}, state) do
+    with {:ok, target_id} <- TachyonParser.parse_user_id(data["userId"]),
+         :ok <- Session.lobby_appoint_boss(state.user.id, target_id) do
+      {:response, state}
+    else
+      {:error, err} -> {:error_response, :invalid_request, to_string(err), state}
+    end
+  end
+
+  def handle_command("lobby/unboss", "request", _msg_id, %{"data" => data}, state) do
+    user_id =
+      case data["userId"] do
+        nil -> {:ok, state.user.id}
+        raw -> TachyonParser.parse_user_id(raw)
+      end
+
+    with {:ok, boss_id} <- user_id,
+         :ok <- Session.lobby_unboss(state.user.id, boss_id) do
+      {:response, state}
+    else
+      {:error, err} -> {:error_response, :invalid_request, to_string(err), state}
+    end
+  end
+
+  def handle_command("lobby/updateClientStatus", "request", _msg_id, %{"data" => data}, state) do
+    mappings = %{"isReady" => :ready?, "assetStatus" => {:asset_status, &parse_asset_status/1}}
+    change_status = Collections.transform_map(data, mappings)
+
+    case Session.lobby_update_client_status(state.user.id, change_status) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/startBattle", "request", _msg_id, _msg, state) do
+    case Session.lobby_start_battle(state.user.id) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/joinBattle", "request", _msg_id, _msg, state) do
+    case Session.lobby_join_battle(state.user.id) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
+  def handle_command("lobby/subscribeList", "request", _msg_id, _msg, state) do
+    case Session.subscribe_lobby_list(state.user.id) do
+      {:ok, list} ->
+        ev =
+          Schema.event("lobby/listReset", %{
+            lobbies:
+              Enum.map(list, fn {id, overview} ->
+                {id, lobby_overview_to_tachyon(id, overview)}
+              end)
+              |> Enum.into(%{})
+          })
+
+        {:response, {nil, [ev]}, state}
+    end
+  end
+
+  def handle_command("lobby/unsubscribeList", "request", _msg_id, _msg, state) do
+    :ok = Session.unsubscribe_lobby_list(state.user.id)
+    {:response, state}
+  end
+
+  def handle_command("lobby/kickban", "request", _msg_id, %{"data" => data}, state) do
+    case TachyonParser.parse_user_id(data["userId"]) do
+      {:ok, target_id} ->
+        ban_until = parse_ban_until(data["banUntil"])
+
+        case Session.lobby_kickban(state.user.id, target_id, ban_until) do
+          :ok -> {:response, state}
+          {:error, :not_boss} -> {:error_response, :invalid_request, state}
+          {:error, reason} -> {:error_response, :invalid_request, inspect(reason), state}
+        end
+
+      {:error, err} ->
+        {:error_response, :invalid_request, inspect(err), state}
+    end
+  end
+
+  def handle_command(_command_id, _message_type, _message_id, _message, state) do
+    {:error_response, :command_unimplemented, state}
+  end
+
+  defp build_user_self_event(user, sess_state) do
+    {friends, incoming, outgoing} = get_user_friends(user.id)
+
+    event = %{
+      user: %{
+        userId: to_string(user.id),
+        username: user.name,
+        displayName: user.name,
+        clanId: nil,
+        countryCode: user.country,
+        status: :menu,
+        party: party_state_to_tachyon(sess_state.party),
+        invitedToParties: Enum.map(sess_state.invited_to_parties, &party_state_to_tachyon/1),
+        friendIds: Enum.map(friends, fn %{userId: uid} -> uid end),
+        outgoingFriendRequest: outgoing,
+        incomingFriendRequest: incoming,
+        ignoreIds: [],
+        matchmaking: matchmaking_state_to_tachyon(sess_state.matchmaking),
+        # TODO. For now it's just there so clients don't break on missing
+        # required property
+        clanInvites: [],
+        currentLobby: sess_state.current_lobby,
+        roles: roles_to_tachyon(user.roles)
+      }
+    }
+
+    if sess_state.current_battle do
+      put_in(event, [:user, :currentBattle], battle_state_to_tachyon(sess_state.current_battle))
+    else
+      event
+    end
+  end
+
+  # Ensure a session is started for the given user id. Register both the session
+  # and the connection. If a connection already exists, terminates it and
+  # replace it in the player registry.
+  # More work is required here, to seed the session with some initial
+  # state. Because if the node holding the session process shuts down,
+  # restarting the connection (through the supervisor) isn't enough.
+  # The state associated with the connected player will not match
+  # the brand new session.
+  defp setup_session(user) do
+    case SessionSupervisor.start_session(user) do
+      {:ok, session_pid} ->
+        {:ok, _pid} = Registry.register_and_kill_existing(user.id)
+
+        self_state = %{
+          party: nil,
+          invited_to_parties: [],
+          current_lobby: nil,
+          current_battle: nil,
+          matchmaking: :no_matchmaking
+        }
+
+        {:ok, session_pid, self_state}
+
+      {:error, {:already_started, pid}} ->
+        case Session.replace_connection(pid, self()) do
+          # This can happen when the session dies/terminate between the
+          # start_session and the replace_connection. In which case, try again.
+          # When a user disconnect and immediately reconnect it can happen
+          # that the session is still registered
+          :died ->
+            setup_session(user)
+
+          {:ok, old_conn_pid, sess_state} ->
+            force_disconnect(old_conn_pid)
+            {:ok, _pid} = Registry.register_and_kill_existing(user.id)
+            {:ok, pid, sess_state}
+        end
+    end
+  end
+
+  defp message_source_to_tachyon(source) do
+    case source do
+      {:player, player_id} ->
+        %{type: :player, userId: to_string(player_id)}
+
+      {:party, party_id, sender_id} ->
+        %{type: :party, partyId: party_id, userId: to_string(sender_id)}
+
+      {:lobby, lobby_id, sender_id} ->
+        %{type: :lobby, lobbyId: lobby_id, userId: to_string(sender_id)}
+    end
+  end
+
+  defp message_target_from_tachyon(target) do
+    case target["type"] do
+      "player" ->
+        case Integer.parse(target["userId"]) do
+          {user_id, ""} -> {:ok, {:player, user_id}}
+          _other -> {:error, :invalid_recipient}
+        end
+
+      "party" ->
+        {:ok, :party}
+
+      "lobby" ->
+        {:ok, :lobby}
+
+      _other ->
+        {:error, :invalid_recipient}
+    end
+  end
+
+  defp message_to_tachyon(message) do
+    %{
+      message: message.content,
+      source: message_source_to_tachyon(message.source),
+      timestamp: message.timestamp,
+      marker: to_string(message.marker)
+    }
+  end
+
+  defp parse_since(nil), do: :latest
+  defp parse_since(%{"type" => "latest"}), do: :latest
+  defp parse_since(%{"type" => "from_start"}), do: :from_start
+
+  defp parse_since(%{"type" => "marker", "value" => marker}) do
+    case Integer.parse(marker) do
+      {m, ""} -> {:marker, m}
+      # invalid markers won't be found in the queue
+      _other -> {:marker, :invalid}
+    end
+  end
+
+  defp parse_asset_status(status) do
+    # the json schema validation already prevent values outside this enum
+    case status do
+      "missing" -> :missing
+      "downloading" -> :downloading
+      "complete" -> :complete
+    end
+  end
+
+  @spec get_user(String.t()) :: {:ok, T.user()} | {:error, :invalid_user}
+  defp get_user(raw_id) do
+    with {:ok, user_id} <- TachyonParser.parse_user_id(raw_id),
+         user when not is_nil(user) <- Account.get_user(user_id) do
+      {:ok, user}
+    else
+      _other -> {:error, :invalid_user}
+    end
+  end
+
+  @spec get_user_friends(User.id()) ::
+          {friends :: [term()], incoming :: [term()], outgoing :: [term()]}
+  def get_user_friends(user_id) do
+    epoch = ~N[1970-01-01 00:00:00]
+
+    friends =
+      Account.list_friends_for_user(user_id)
+      |> Enum.map(fn friend ->
+        id = if friend.user1_id == user_id, do: friend.user2_id, else: friend.user1_id
+        %{userId: to_string(id), addedAt: NaiveDateTime.diff(friend.inserted_at, epoch)}
+      end)
+
+    {outgoing, incoming} = Account.list_requests_for_user(user_id)
+
+    incoming =
+      Enum.map(incoming, fn req ->
+        %{from: to_string(req.from_user_id), sentAt: NaiveDateTime.diff(req.inserted_at, epoch)}
+      end)
+
+    outgoing =
+      Enum.map(outgoing, fn req ->
+        %{to: to_string(req.to_user_id), sentAt: NaiveDateTime.diff(req.inserted_at, epoch)}
+      end)
+
+    {friends, incoming, outgoing}
+  end
+
+  defp party_state_to_tachyon(nil), do: nil
+
+  defp party_state_to_tachyon(party_state) do
+    %{
+      id: party_state.id,
+      members:
+        Enum.map(party_state.members, fn {_id, m} ->
+          %{
+            userId: to_string(m.id),
+            joinedAt: DateTime.to_unix(m.joined_at, :microsecond)
+          }
+        end),
+      maxMembers: party_state.max_members,
+      invited:
+        Enum.map(party_state.invited, fn {_id, m} ->
+          %{
+            userId: to_string(m.id),
+            invitedAt: DateTime.to_unix(m.invited_at, :microsecond)
+          }
+        end)
+    }
+  end
+
+  defp matchmaking_state_to_tachyon(:no_matchmaking), do: %{state: :no_matchmaking}
+
+  defp matchmaking_state_to_tachyon({:searching, %PT.MmSearchingState{} = searching}) do
+    %{
+      state: :queuing,
+      queues: Enum.map(searching.joined_queues, &queue_ref_to_tachyon/1)
+    }
+  end
+
+  defp matchmaking_state_to_tachyon({:pairing, %PT.MmPairingState{} = pairing}) do
+    queue =
+      pairing.paired_queue
+      |> queue_ref_to_tachyon()
+      |> Map.merge(%{
+        timeoutAt: DateTime.to_unix(pairing.timeout_at, :microsecond),
+        hasAlreadyReadied: pairing.readied?
+      })
+
+    %{
+      state: :found,
+      queue: queue,
+      otherQueues: Enum.map(pairing.frozen_queues, &queue_ref_to_tachyon/1)
+    }
+  end
+
+  defp queue_ref_to_tachyon({queue_id, version}), do: %{id: queue_id, version: version}
+
+  def battle_state_to_tachyon(nil), do: nil
+
+  def battle_state_to_tachyon(%PT.BattleState{} = battle) do
+    %{
+      battleId: battle.id,
+      username: battle.username,
+      password: battle.password,
+      ips: battle.ips,
+      port: battle.port,
+      engine: %{version: battle.engine.version},
+      game: %{springName: battle.game.spring_name},
+      map: %{springName: battle.map.spring_name}
+    }
+  end
+
+  # Converts Teiserver role names to Tachyon role names.
+  # Only roles that have Tachyon equivalents are included.
+  defp roles_to_tachyon(teiserver_roles) when is_list(teiserver_roles) do
+    teiserver_roles
+    |> Enum.map(fn role ->
+      case role do
+        "Contributor" -> "contributor"
+        "Admin" -> "admin"
+        "Moderator" -> "moderator"
+        "Caster" -> "tournament_caster"
+        "Tournament winner" -> "tournament_winner"
+        _other -> nil
+      end
+    end)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp lobby_details_to_tachyon(%LT.Details{} = details) do
+    mappings = %{
+      id: :id,
+      players: {:players, &player_updates_to_tachyon/1},
+      spectators: {:spectators, &spectator_updates_to_tachyon/1},
+      bots: {:bots, &bot_updates_to_tachyon/1},
+      current_battle:
+        {:currentBattle,
+         %{id: :id, started_at: {:startedAt, &DateTime.to_unix(&1, :microsecond)}}},
+      name: :name,
+      map_name: :mapName,
+      ally_team_config: {:allyTeamConfig, &ally_team_config_to_tachyon/1},
+      boss_enabled?: :areBossesEnabled,
+      bosses:
+        {:bosses,
+         fn bs ->
+           Enum.reduce(bs, %{}, fn id, acc -> Map.put(acc, to_string(id), %{}) end)
+         end},
+      game_options: {:gameOptions, &game_options_to_tachyon/1},
+      tags: :tags,
+      engine_version: :engineVersion,
+      game_version: :gameVersion,
+      current_vote: {:currentVote, &vote_to_tachyon/1},
+      vote_history: {:voteHistory, &vote_history_to_tachyon/1}
+    }
+
+    Collections.transform_map(details, mappings)
+    |> Collections.remove_nil_vals()
+  end
+
+  defp lobby_update_to_tachyon(lobby_id, update_map) do
+    mappings = %{
+      players: {:players, &player_updates_to_tachyon/1},
+      spectators: {:spectators, &spectator_updates_to_tachyon/1},
+      bots: {:bots, &bot_updates_to_tachyon/1},
+      current_battle:
+        {:currentBattle,
+         %{id: :id, started_at: {:startedAt, &DateTime.to_unix(&1, :microsecond)}}},
+      name: :name,
+      map_name: :mapName,
+      ally_team_config: {:allyTeamConfig, &ally_team_config_to_tachyon/1},
+      bosses: :bosses,
+      current_vote: {:currentVote, &vote_to_tachyon/1},
+      vote_history: {:voteHistory, &vote_history_to_tachyon/1},
+      game_options: {:gameOptions, &game_options_to_tachyon/1},
+      tags: :tags
+    }
+
+    data = Collections.transform_map(update_map, mappings)
+
+    if data == %{},
+      do: %{},
+      else: Map.put(data, :id, lobby_id)
+  end
+
+  defp player_updates_to_tachyon(nil), do: nil
+
+  defp player_updates_to_tachyon(updates) do
+    Enum.reduce(updates, %{}, fn
+      {p_id, nil}, m ->
+        Map.put(m, to_string(p_id), nil)
+
+      {p_id, player_updates}, m ->
+        mappings = %{
+          ready?: :isReady,
+          asset_status: :assetStatus
+        }
+
+        val =
+          get_tachyon_teams(player_updates)
+          |> Map.put(:id, to_string(p_id))
+          |> Map.merge(Collections.transform_map(player_updates, mappings))
+
+        Map.put(m, to_string(p_id), val)
+    end)
+  end
+
+  defp spectator_updates_to_tachyon(nil), do: nil
+
+  defp spectator_updates_to_tachyon(updates) do
+    Enum.reduce(updates, %{}, fn
+      {s_id, nil}, m ->
+        Map.put(m, to_string(s_id), nil)
+
+      {s_id, spec_updates}, m ->
+        mappings = %{join_queue_position: :joinQueuePosition}
+        val = Map.merge(%{id: to_string(s_id)}, Collections.transform_map(spec_updates, mappings))
+        Map.put(m, to_string(s_id), val)
+    end)
+  end
+
+  defp bot_updates_to_tachyon(nil), do: nil
+
+  defp bot_updates_to_tachyon(updates) do
+    Enum.reduce(updates, %{}, fn
+      {b_id, nil}, m ->
+        Map.put(m, to_string(b_id), nil)
+
+      {b_id, bot_updates}, m ->
+        mappings = %{
+          host_user_id: {:hostUserId, &to_string/1},
+          short_name: :shortName,
+          name: :name,
+          version: :version,
+          options: :options
+        }
+
+        val =
+          get_tachyon_teams(bot_updates)
+          |> Map.put(:id, to_string(b_id))
+          |> Map.merge(Collections.transform_map(bot_updates, mappings))
+
+        Map.put(m, to_string(b_id), val)
+    end)
+  end
+
+  defp ally_team_config_to_tachyon(config) do
+    for {at, i} <- Enum.with_index(config), into: %{} do
+      val =
+        if at == nil do
+          nil
+        else
+          %{
+            maxTeams: at.max_teams,
+            # internal representation is the same as tachyon for startbox
+            startBox: at.start_box,
+            teams:
+              for {team, i} <- Enum.with_index(at.teams), into: %{} do
+                val = if team == nil, do: nil, else: %{maxPlayers: team.max_players}
+                {to_string(i), val}
+              end
+          }
+        end
+
+      {to_string(i), val}
+    end
+  end
+
+  defp game_options_to_tachyon(options) do
+    Enum.map(options, fn
+      {k, nil} -> {k, nil}
+      {k, v} -> {k, %{value: v}}
+    end)
+    |> Enum.into(%{})
+  end
+
+  defp vote_to_tachyon(nil), do: nil
+
+  defp vote_to_tachyon(vote) do
+    mapping = %{
+      id: :id,
+      action: {:action, &vote_action_to_tachyon/1},
+      initiator: {:initiator, &to_string/1},
+      voters: :voters,
+      until: {:until, &DateTime.to_unix(&1, :microsecond)},
+      quorum: :quorum,
+      majority: :majority
+    }
+
+    Map.update!(vote, :voters, fn vs ->
+      for {v_id, v} <- vs, into: %{} do
+        {to_string(v_id), %{vote: v}}
+      end
+    end)
+    |> Collections.transform_map(mapping)
+  end
+
+  defp vote_history_to_tachyon(history) do
+    mapping = %{
+      outcome: :outcome,
+      finished_at: {:finishedAt, &DateTime.to_unix(&1, :microsecond)},
+      vote: {:vote, &vote_action_to_tachyon/1}
+    }
+
+    for {id, record} <- history, into: %{} do
+      {id, Collections.transform_map(record, mapping)}
+    end
+  end
+
+  defp vote_action_to_tachyon(action) do
+    case action do
+      {:change_map, name} ->
+        %{type: :changeMap, newMapName: name}
+
+      {:appoint_boss, boss_id} ->
+        %{type: :appointBoss, bossId: to_string(boss_id)}
+
+      {:kickban, user_id, nil} ->
+        %{type: :kickban, userId: to_string(user_id)}
+
+      {:kickban, user_id, ban_until} ->
+        %{
+          type: :kickban,
+          userId: to_string(user_id),
+          banUntil: DateTime.to_unix(ban_until, :microsecond)
+        }
+    end
+  end
+
+  # handle partial overview object
+  defp lobby_overview_to_tachyon(_lobby_id, nil), do: nil
+
+  defp lobby_overview_to_tachyon(lobby_id, overview) do
+    mapping_spec = %{
+      name: :name,
+      player_count: :playerCount,
+      max_player_count: :maxPlayerCount,
+      map_name: :mapName,
+      engine_version: :engineVersion,
+      game_version: :gameVersion,
+      boss_enabled?: :areBossesEnabled,
+      tags: :tags,
+      current_battle:
+        {:currentBattle,
+         %{
+           id: :id,
+           started_at: {:startedAt, &DateTime.to_unix(&1, :microsecond)}
+         }}
+    }
+
+    base =
+      get_tachyon_teams(overview) |> Map.put(:id, lobby_id) |> Map.put(:currentBattle, nil)
+
+    Map.merge(base, Collections.transform_map(overview, mapping_spec))
+  end
+
+  defp get_tachyon_teams(data) do
+    if is_map_key(data, :team) do
+      val = data.team
+
+      case val do
+        nil ->
+          %{allyTeam: nil, team: nil, player: nil}
+
+        {x, y, z} ->
+          %{allyTeam: to_string(x), team: to_string(y), player: to_string(z)}
+      end
+    else
+      %{}
+    end
+  end
+
+  defp parse_ban_until(nil), do: nil
+
+  defp parse_ban_until(ts) do
+    case DateTime.from_unix(ts, :microsecond) do
+      {:ok, dt} -> if DateTime.compare(dt, DateTime.utc_now()) == :gt, do: dt, else: nil
+      _error -> nil
+    end
+  end
+end

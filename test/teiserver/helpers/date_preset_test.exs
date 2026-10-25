@@ -1,0 +1,46 @@
+defmodule Teiserver.Helpers.DatePresetTest do
+  alias Teiserver.Helper.DatePresets
+  use Teiserver.DataCase, async: true
+
+  test "test basic presets" do
+    DatePresets.presets()
+    |> Enum.map(fn p ->
+      DatePresets.parse(p, "", "")
+    end)
+  end
+
+  test "test long presets" do
+    DatePresets.long_presets()
+    |> Enum.map(fn p ->
+      DatePresets.parse(p, "", "")
+    end)
+  end
+
+  test "test short ranges" do
+    DatePresets.short_ranges()
+    |> Enum.map(fn p ->
+      DatePresets.parse(p, "", "")
+    end)
+  end
+
+  test "test long ranges" do
+    DatePresets.long_ranges()
+    |> Enum.map(fn p ->
+      DatePresets.parse(p, "", "")
+    end)
+  end
+
+  test "test past dates" do
+    DatePresets.past_dates()
+    |> Enum.map(fn p ->
+      DatePresets.parse(p)
+    end)
+  end
+
+  test "test future dates" do
+    DatePresets.future_dates()
+    |> Enum.map(fn p ->
+      DatePresets.parse(p)
+    end)
+  end
+end

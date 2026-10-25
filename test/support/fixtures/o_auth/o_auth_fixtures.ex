@@ -1,0 +1,138 @@
+defmodule Teiserver.OAuthFixtures do
+  @moduledoc false
+  alias Teiserver.Account
+  alias Teiserver.OAuth
+  alias Teiserver.OAuth.Application
+  alias Teiserver.OAuth.Code
+  alias Teiserver.OAuth.Credential
+  alias Teiserver.OAuth.Token
+  alias Teiserver.Repo
+
+  def app_attrs(owner_id) do
+    %{
+      name: "fixture app",
+      uid: "fixture_app",
+      owner_id: owner_id,
+      scopes: ["tachyon.lobby"],
+      redirect_uris: ["http://localhost/foo"],
+      description: "app created as part of a test"
+    }
+  end
+
+  def create_app(attrs) do
+    %Application{}
+    |> Application.changeset(attrs)
+    |> Repo.insert!()
+    |> Repo.preload([:owner])
+  end
+
+  def update_app(app, changes) do
+    app |> Application.changeset(changes) |> Repo.update!()
+  end
+
+  def code_attrs(%Account.User{} = user, app) do
+    now = DateTime.utc_now()
+    {verifier, challenge, method} = generate_challenge()
+
+    %{
+      value: OAuth.generate_token_value(),
+      owner: user,
+      owner_id: user.id,
+      application: app,
+      scopes: app.scopes,
+      expires_at: DateTime.shift(now, minute: 5),
+      redirect_uri: List.first(app.redirect_uris),
+      challenge: challenge,
+      challenge_method: method,
+      _verifier: verifier
+    }
+  end
+
+  def create_code(attrs) do
+    %Code{}
+    |> Code.changeset(attrs)
+    |> Repo.insert!()
+    |> Repo.preload([:owner, :application])
+  end
+
+  def token_attrs(%Account.User{} = user, application) do
+    now = DateTime.utc_now()
+
+    %{
+      value: OAuth.generate_token_value(),
+      owner: user,
+      owner_id: user.id,
+      application_id: application.id,
+      scopes: application.scopes,
+      expires_at: DateTime.shift(now, day: 60),
+      type: :access,
+      refresh_token: nil
+    }
+  end
+
+  def token_attrs(%Teiserver.Bot.Bot{} = bot, application) do
+    now = DateTime.utc_now()
+
+    %{
+      value: OAuth.generate_token_value(),
+      bot: bot,
+      bot_id: bot.id,
+      application_id: application.id,
+      scopes: application.scopes,
+      expires_at: DateTime.shift(now, day: 60),
+      type: :access,
+      refresh_token: nil
+    }
+  end
+
+  def create_token(attrs) do
+    %Token{} |> Token.changeset(attrs) |> Repo.insert!()
+  end
+
+  def credential_attrs(bot, app_id) do
+    %{
+      application_id: app_id,
+      bot_id: bot.id,
+      client_id: UUID.uuid4(),
+      hashed_secret: UUID.uuid4()
+    }
+  end
+
+  def create_credential(attrs) do
+    %Credential{} |> Credential.changeset(attrs) |> Repo.insert!()
+  end
+
+  @doc """
+  given a user, will create a OAuth application and a valid token for that
+  user, returning both
+  """
+  def setup_token(%Account.User{} = user, opts \\ []) do
+    uid = for _i <- 1..10, into: "", do: <<Enum.random(~c"abcdefghijklmnopqrstuvwxyz")>>
+
+    app =
+      app_attrs(user.id)
+      |> Map.put(:uid, uid)
+      |> Map.update!(:scopes, fn s -> Keyword.get(opts, :scopes, s) end)
+      |> create_app()
+
+    token = token_attrs(user, app) |> create_token()
+    %{app: app, token: token}
+  end
+
+  defp generate_challenge do
+    # A-Z,a-z,0-9 and -._~ are authorized, but can't be bothered to cover all
+    # of that. hex encoding will fit
+    # hardcoded random bytes generated with :crypto.strong_rand_bytes(32)
+    bytes =
+      <<30, 33, 141, 180, 13, 27, 42, 190, 106, 230, 111, 140, 162, 230, 128, 110, 149, 65, 33,
+        124, 129, 9, 89, 93, 94, 248, 46, 34, 116, 186, 8, 24>>
+
+    verifier = Base.hex_encode32(bytes, padding: false)
+    challenge = hash_verifier(verifier)
+
+    {verifier, challenge, "S256"}
+  end
+
+  def hash_verifier(verifier),
+    do: verifier |> then(&:crypto.hash(:sha256, &1)) |> Base.url_encode64(padding: false)
+end

@@ -1,0 +1,148 @@
+defmodule Teiserver.Logging.Tasks.PersistServerYearTask do
+  @moduledoc false
+
+  alias Teiserver.Helper.DateHelper
+  alias Teiserver.Logging
+  alias Teiserver.Logging.ServerDayLogLib
+  alias Teiserver.Logging.Tasks.PersistServerYearTask
+  use Oban.Worker, queue: :teiserver
+  import Ecto.Query, warn: false
+
+  @impl Oban.Worker
+  @spec perform(any) :: :ok
+  def perform(_job) do
+    log =
+      case Logging.get_last_server_year_log() do
+        nil ->
+          perform_first_time()
+
+        date ->
+          perform_standard(date)
+      end
+
+    if log != nil do
+      %{}
+      |> PersistServerYearTask.new()
+      |> Oban.insert()
+    end
+
+    :ok
+  end
+
+  # For when there are no existing logs
+  # we need to ensure the earliest log is from last year, not this year
+  defp perform_first_time do
+    first_logs =
+      Logging.list_server_day_logs(
+        order: "Oldest first",
+        limit: 1
+      )
+
+    case first_logs do
+      [log] ->
+        log_year = log.date.year
+
+        if log_year < Date.utc_today().year do
+          logs =
+            Logging.list_server_day_logs(
+              search: [
+                start_date: DateHelper.beginning_of_year(log.date),
+                end_date: DateHelper.end_of_year(log.date)
+              ],
+              limit: 366
+            )
+
+          user_activity_logs =
+            Logging.list_user_activity_day_logs(
+              search: [
+                start_date: DateHelper.beginning_of_year(log.date),
+                end_date: DateHelper.end_of_year(log.date)
+              ],
+              limit: 366
+            )
+
+          data =
+            logs
+            |> Enum.zip(user_activity_logs)
+            |> ServerDayLogLib.aggregate_day_logs()
+
+          {:ok, _log} =
+            Logging.create_server_year_log(%{
+              year: log_year,
+              date: DateHelper.beginning_of_year(log.date),
+              data: data
+            })
+        end
+
+      _empty ->
+        nil
+    end
+  end
+
+  # For when we have an existing log
+  defp perform_standard(log_date) do
+    new_date = Date.shift(log_date, year: 1)
+
+    today_year = Date.utc_today().year
+
+    if new_date.year < today_year do
+      logs =
+        Logging.list_server_day_logs(
+          search: [
+            start_date: DateHelper.beginning_of_year(new_date),
+            end_date: DateHelper.end_of_year(new_date)
+          ],
+          limit: 366
+        )
+
+      user_activity_logs =
+        Logging.list_user_activity_day_logs(
+          search: [
+            start_date: DateHelper.beginning_of_year(new_date),
+            end_date: DateHelper.end_of_year(new_date)
+          ],
+          limit: 366
+        )
+
+      data =
+        logs
+        |> Enum.zip(user_activity_logs)
+        |> ServerDayLogLib.aggregate_day_logs()
+
+      {:ok, _log} =
+        Logging.create_server_year_log(%{
+          year: new_date.year,
+          date: new_date,
+          data: data
+        })
+    else
+      nil
+    end
+  end
+
+  @spec year_so_far() :: map()
+  def year_so_far do
+    now = DateTime.utc_now()
+
+    user_activity_logs =
+      Logging.list_user_activity_day_logs(
+        search: [
+          start_date: DateHelper.beginning_of_year(now)
+        ],
+        limit: 366
+      )
+
+    Logging.list_server_day_logs(
+      search: [
+        start_date: DateHelper.beginning_of_year(now)
+      ],
+      limit: 366
+    )
+    |> Enum.zip(user_activity_logs)
+    |> ServerDayLogLib.aggregate_day_logs()
+    |> Jason.encode!()
+    |> Jason.decode!()
+
+    # We encode and decode so it's the same format as in the database
+  end
+end

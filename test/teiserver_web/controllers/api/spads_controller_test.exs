@@ -1,0 +1,274 @@
+defmodule TeiserverWeb.API.SpadsControllerTest do
+  alias Teiserver.Account
+  alias Teiserver.Account.Auth
+  alias Teiserver.Account.ClientLib
+  alias Teiserver.Client
+  alias Teiserver.Game.MatchRatingLib
+  alias Teiserver.Lobby
+  alias Teiserver.TeiserverTestLib
+  alias TeiserverWeb.API.SpadsController
+
+  use TeiserverWeb.ConnCase, async: false
+
+  import TeiserverTestLib,
+    only: [
+      new_user: 0,
+      make_lobby: 1
+    ]
+
+  describe "ratings" do
+    test "unauthorized", %{conn: conn} do
+      conn = get(conn, ~p"/teiserver/api/spads/get_rating/1/Large Team")
+      assert response(conn, 401)
+    end
+
+    test "not a valid rating type", %{conn: conn} do
+      user = new_bot_user()
+
+      conn =
+        conn
+        |> put_authorization_header(user)
+        |> get(~p"/teiserver/api/spads/get_rating/1/Not_actually_large_team")
+
+      response = response(conn, 200)
+      data = Jason.decode!(response)
+
+      assert data == %{"rating_value" => 16.67, "uncertainty" => 8.33}
+    end
+
+    test "non-user", %{conn: conn} do
+      user = new_bot_user()
+
+      conn =
+        conn
+        |> put_authorization_header(user)
+        |> get(~p"/teiserver/api/spads/get_rating/1/Large Team")
+
+      response = response(conn, 200)
+      data = Jason.decode!(response)
+
+      assert data == %{"rating_value" => 16.67, "uncertainty" => 8.33}
+    end
+
+    test "existing user", %{conn: conn} do
+      user = new_bot_user()
+      TeiserverTestLib.clear_cache(:teiserver_game_rating_types)
+      rating_type_id = MatchRatingLib.rating_type_name_lookup()["Large Team"]
+
+      {:ok, _rating} =
+        Account.create_rating(%{
+          user_id: user.id,
+          rating_type_id: rating_type_id,
+          rating_value: 20,
+          skill: 25,
+          uncertainty: 5,
+          leaderboard_rating: 5,
+          last_updated: DateTime.utc_now(),
+          season: 1
+        })
+
+      Client.login(user, :spring, "127.0.0.1")
+
+      lobby_id =
+        make_lobby(%{name: "Test", founder_id: user.id, founder_name: user.name})
+
+      Client.join_battle(user.id, lobby_id, true)
+
+      conn =
+        conn
+        |> put_authorization_header(user)
+        |> get(~p"/teiserver/api/spads/get_rating/#{user.id}/Large_team")
+
+      response = response(conn, 200)
+      data = Jason.decode!(response)
+
+      assert data == %{"rating_value" => 20, "uncertainty" => 5}
+    end
+  end
+
+  describe "balance" do
+    test "unauthorized", %{conn: conn} do
+      params = %{}
+      conn = get(conn, ~p"/teiserver/api/spads/balance_battle", params)
+      assert response(conn, 401)
+    end
+
+    test "empty data", %{conn: conn} do
+      user = new_bot_user()
+      params = %{"bots" => "{}", "players" => "{}"}
+
+      conn =
+        conn
+        |> put_authorization_header(user)
+        |> get(~p"/teiserver/api/spads/balance_battle", params)
+
+      response = response(conn, 200)
+      data = Jason.decode!(response)
+
+      assert data == %{}
+    end
+
+    test "bad decode", %{conn: conn} do
+      user = new_bot_user()
+      params = %{"bots" => "{}", "players" => "{123 - 123}"}
+
+      conn =
+        conn
+        |> put_authorization_header(user)
+        |> get(~p"/teiserver/api/spads/balance_battle", params)
+
+      response = response(conn, 200)
+      data = Jason.decode!(response)
+
+      assert data == %{}
+    end
+
+    test "players", %{conn: conn} do
+      user = new_bot_user()
+
+      player1 = new_user()
+      player2 = new_user()
+
+      Client.login(player1, :spring, "127.0.0.1")
+      Client.login(player2, :spring, "127.0.0.1")
+
+      lobby_id =
+        make_lobby(%{name: "Test", founder_id: user.id, founder_name: user.name})
+
+      Lobby.force_add_user_to_lobby(player1.id, lobby_id)
+      Lobby.force_add_user_to_lobby(player2.id, lobby_id)
+
+      ClientLib.update_client(player1.id, %{player: true})
+      ClientLib.update_client(player2.id, %{player: true})
+
+      params =
+        %{
+          "nbTeams" => "2",
+          "players" =>
+            "{'#{player1.name}': {'scriptPass': '123', 'port': None, 'skill': 16.67, 'color': {'blue': 255, 'red': 0, 'green': 85}, 'ip': None, 'battleStatus': {'ready': 1, 'bonus': 0, 'id': 1, 'side': 0, 'sync': 1, 'workaroundId': 1, 'team': 1, 'mode': 1, 'workaroundTeam': 1}, 'sigma': 8.33}, '#{player2.name}': {'port': None, 'scriptPass': '5232537262', 'sigma': 4.07, 'ip': None, 'battleStatus': {'mode': 1, 'team': 0, 'workaroundId': 0, 'side': 1, 'sync': 1, 'id': 0, 'bonus': 0, 'ready': 0}, 'skill': 27.65, 'color': {'green': 0, 'blue': 0, 'red': 255}}}",
+          "teamSize" => "2.0"
+        }
+
+      conn =
+        conn
+        |> put_authorization_header(user)
+        |> get(~p"/teiserver/api/spads/balance_battle", params)
+
+      response = response(conn, 200)
+      data = Jason.decode!(response)
+
+      assert data["bot_assign_hash"] == %{}
+      assert Map.has_key?(data["player_assign_hash"], player1.name)
+      assert Map.has_key?(data["player_assign_hash"], player2.name)
+    end
+
+    test "bots", %{conn: conn} do
+      user = new_bot_user()
+
+      player1 = new_user()
+      player2 = new_user()
+
+      # We expect this to return nothing as we have bots included in this but
+      # without a client logged in it won't run the conditionals correctly
+      # and we potentially get a false-positive test result
+      Client.login(player1, :spring, "127.0.0.1")
+      Client.login(player2, :spring, "127.0.0.1")
+
+      lobby_id =
+        make_lobby(%{name: "Test", founder_id: user.id, founder_name: user.name})
+
+      Lobby.force_add_user_to_lobby(player1.id, lobby_id)
+      Lobby.force_add_user_to_lobby(player2.id, lobby_id)
+
+      ClientLib.update_client(player1.id, %{player: true})
+      ClientLib.update_client(player2.id, %{player: true})
+
+      params =
+        %{
+          "bots" =>
+            "{'BARbarianAI(1)': {'color': {'red': 243, 'blue': 0, 'green': 0}, 'skill': 20, 'battleStatus': {'team': 0, 'mode': 1, 'bonus': 0, 'ready': 1, 'side': 0, 'sync': 1, 'id': 2}, 'aiDll': 'BARb', 'owner': 'SomeUser'}}",
+          "nbTeams" => "2",
+          "players" =>
+            "{'#{player1.name}': {'scriptPass': '123', 'port': None, 'skill': 16.67, 'color': {'blue': 255, 'red': 0, 'green': 85}, 'ip': None, 'battleStatus': {'ready': 1, 'bonus': 0, 'id': 1, 'side': 0, 'sync': 1, 'workaroundId': 1, 'team': 1, 'mode': 1, 'workaroundTeam': 1}, 'sigma': 8.33}, '#{player2.name}': {'port': None, 'scriptPass': '5232537262', 'sigma': 4.07, 'ip': None, 'battleStatus': {'mode': 1, 'team': 0, 'workaroundId': 0, 'side': 1, 'sync': 1, 'id': 0, 'bonus': 0, 'ready': 0}, 'skill': 27.65, 'color': {'green': 0, 'blue': 0, 'red': 255}}}",
+          "teamSize" => "2.0"
+        }
+
+      conn =
+        conn
+        |> put_authorization_header(user)
+        |> get(~p"/teiserver/api/spads/balance_battle", params)
+
+      response = response(conn, 200)
+      data = Jason.decode!(response)
+
+      assert data == %{}
+    end
+
+    test "can derive team dimensions from balance result" do
+      # This is the default balance result when no players
+      # Defined inside balance_lib.ex
+      balance_result = %{
+        logs: [],
+        time_taken: 0,
+        captains: %{},
+        deviation: 0,
+        ratings: %{},
+        team_groups: %{},
+        team_players: %{},
+        team_sizes: %{},
+        means: %{},
+        stdevs: %{},
+        has_parties?: false
+      }
+
+      assert SpadsController.get_balance_team_dimensions(balance_result) == :error
+      assert SpadsController.get_balance_team_dimensions(nil) == :error
+      assert SpadsController.get_balance_team_dimensions(%{}) == :error
+      assert SpadsController.get_balance_team_dimensions(%{team_sizes: []}) == :error
+      assert SpadsController.get_balance_team_dimensions(%{team_sizes: %{}}) == :error
+      assert SpadsController.get_balance_team_dimensions(%{team_sizes: %{1 => 0}}) == :error
+      assert SpadsController.get_balance_team_dimensions(%{team_sizes: %{1 => nil}}) == :error
+
+      assert SpadsController.get_balance_team_dimensions(%{team_sizes: %{1 => 4}}) ==
+               {:ok, {1, 4}}
+
+      assert SpadsController.get_balance_team_dimensions(%{team_sizes: %{1 => 8, 2 => 6}}) ==
+               {:ok, {2, 8}}
+    end
+
+    test "bad params", %{conn: conn} do
+      # There was an error where passing in a value which didn't decode correctly could
+      # produce an exception, this query contains bad data which would previously have
+      # generated the error
+      user = new_bot_user()
+
+      conn =
+        conn
+        |> put_authorization_header(user)
+        |> get(~p"/teiserver/api/spads/balance_battle?players=")
+
+      response = response(conn, 200)
+      data = Jason.decode!(response)
+
+      assert data == %{}
+    end
+  end
+
+  describe "end game data" do
+    test "unauthorized", %{conn: conn} do
+      conn = post(conn, ~p"/teiserver/api/spads/end_game_data")
+      assert response(conn, 401)
+    end
+  end
+
+  def new_bot_user do
+    user = new_user()
+    Auth.add_roles(user.id, ["Bot"])
+    user
+  end
+
+  def put_authorization_header(conn, user) do
+    conn
+    |> put_req_header("authorization", "Basic #{Base.encode64("#{user.name}:password")}")
+  end
+end

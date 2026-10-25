@@ -1,0 +1,231 @@
+defmodule TeiserverWeb.Admin.ChatLive.Index do
+  alias Teiserver.Account
+  alias Teiserver.Chat
+  alias Teiserver.Chat.LobbyMessageLib
+  alias Teiserver.Coordinator
+  use TeiserverWeb, :live_view
+
+  @impl Phoenix.LiveView
+  def mount(_params, _session, socket) do
+    case allow?(socket.assigns[:current_user], "Reviewer") do
+      true ->
+        socket =
+          socket
+          |> assign(:site_menu_active, "chat")
+          |> assign(:view_colour, LobbyMessageLib.colours())
+          |> assign(:messages, [])
+          |> assign(:usernames, %{})
+          |> add_breadcrumb(name: "Admin", url: "/teiserver/admin")
+          |> add_breadcrumb(name: "Chat", url: "/admin/chat")
+          |> default_filters()
+          |> assign(:searching, false)
+          |> assign(:usernames, %{})
+          |> assign(:messages, [])
+
+        {:ok, socket}
+
+      false ->
+        {:ok,
+         socket
+         |> redirect(to: ~p"/")}
+    end
+  end
+
+  @impl Phoenix.LiveView
+  def handle_params(params, _url, %{assigns: %{filters: filters}} = socket) do
+    filters =
+      if params["userid"] do
+        user = Account.get_user_by_id!(params["userid"])
+
+        Map.merge(filters, %{
+          "username" => user.name,
+          "user-raw-filter" => user.name,
+          "userids" => [user.id]
+        })
+      else
+        filters
+      end
+
+    {:noreply,
+     socket
+     |> assign(:filters, filters)
+     |> get_messages()}
+  end
+
+  @impl Phoenix.LiveView
+  def handle_info(:do_get_messages, socket) do
+    socket = get_messages(socket)
+    {:noreply, socket}
+  end
+
+  @impl Phoenix.LiveView
+  def handle_event("filter-update", event, %{assigns: %{filters: filters}} = socket) do
+    [key] = event["_target"]
+    value = event[key]
+
+    new_filters = Map.put(filters, key, value)
+
+    new_filters =
+      case key do
+        "user-raw-filter" ->
+          userids =
+            value
+            |> String.split(",")
+            |> Enum.map(fn name ->
+              Account.get_userid_from_name(name)
+            end)
+            |> Enum.reject(&(&1 == nil))
+
+          Map.put(new_filters, "userids", userids)
+
+        _other ->
+          new_filters
+      end
+
+    socket =
+      socket
+      |> assign(:filters, new_filters)
+      |> assign(:searching, true)
+      |> get_messages()
+
+    {:noreply, socket}
+  end
+
+  def handle_event("format-update", event, socket) do
+    [key] = event["_target"]
+    value = event[key]
+
+    new_filters = Map.put(socket.assigns.filters, key, value)
+
+    {:noreply,
+     socket
+     |> assign(:filters, new_filters)}
+  end
+
+  defp default_filters(socket) do
+    socket
+    |> assign(:filters, %{
+      "timeframe" => "24 hours",
+      "mode" => "Lobby",
+      "term" => "",
+      "case-sensitive" => "false",
+      "whole-word" => "false",
+      "username" => "",
+      "user-raw-filter" => "",
+      "order" => "Newest first",
+      "message-format" => "Table"
+    })
+  end
+
+  defp get_messages(%{assigns: %{filters: %{"term" => "", "userid" => nil}}} = socket) do
+    socket
+    |> assign(:searching, false)
+  end
+
+  defp get_messages(%{assigns: %{filters: filters}} = socket) when is_connected?(socket) do
+    mode = filters["mode"]
+
+    inserted_after =
+      case filters["timeframe"] do
+        "24 hours" -> DateTime.shift(DateTime.utc_now(), hour: -24)
+        "2 days" -> DateTime.shift(DateTime.utc_now(), day: -2)
+        "7 days" -> DateTime.shift(DateTime.utc_now(), day: -7)
+        _other -> nil
+      end
+
+    excluded_ids =
+      if filters["include_bots"] == "true" do
+        []
+      else
+        [
+          Coordinator.get_coordinator_userid()
+        ]
+      end
+
+    term =
+      {filters["term"],
+       case_sensitive: filters["case-sensitive"] == "true",
+       whole_word: filters["whole-word"] == "true"}
+
+    messages =
+      case mode do
+        nil ->
+          []
+
+        "Lobby" ->
+          Chat.list_lobby_messages(
+            search: [
+              user_id_in: filters["userids"],
+              user_id_not_in: excluded_ids,
+              inserted_after: inserted_after,
+              term: term
+            ],
+            limit: 100,
+            order_by: filters["order"]
+          )
+
+        "Room" ->
+          Chat.list_room_messages(
+            search: [
+              user_id_in: filters["userids"],
+              user_id_not_in: excluded_ids,
+              inserted_after: inserted_after,
+              term: term
+            ],
+            limit: 100,
+            order_by: filters["order"]
+          )
+
+        "Party" ->
+          Chat.list_party_messages(
+            search: [
+              user_id_in: filters["userids"],
+              user_id_not_in: excluded_ids,
+              inserted_after: inserted_after,
+              term: term
+            ],
+            limit: 100,
+            order_by: filters["order"]
+          )
+
+        "Direct" ->
+          Chat.list_direct_messages(
+            search: [
+              member_id_in: filters["userids"],
+              inserted_after: inserted_after,
+              term: term
+            ],
+            limit: 100,
+            preload: [:users],
+            order_by: filters["order"]
+          )
+      end
+
+    extra_usernames =
+      messages
+      |> Enum.flat_map(fn m ->
+        case mode do
+          "Direct" -> [m.from_id, m.to_id]
+          _non_direct -> [m.user_id]
+        end
+      end)
+      |> Enum.reject(fn userid ->
+        Map.has_key?(socket.assigns.usernames, userid)
+      end)
+      |> Map.new(fn userid ->
+        {userid, Account.get_username_by_id(userid)}
+      end)
+
+    new_usernames = Map.merge(socket.assigns.usernames, extra_usernames)
+
+    socket
+    |> assign(:usernames, new_usernames)
+    |> assign(:messages, messages)
+    |> assign(:searching, false)
+  end
+
+  defp get_messages(socket) do
+    socket
+    |> assign(:searching, false)
+  end
+end

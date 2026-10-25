@@ -1,0 +1,242 @@
+defmodule Teiserver.Account.LoginThrottleServer do
+  @moduledoc """
+  Implement a login queue. `attempt_login` returns true mean no need to queue.
+  Otherwise it is put in a queue and will later receive a {:login_accepted, userid} message
+  when it is allowed to do so
+  """
+
+  alias Teiserver.Account
+  alias Teiserver.Account.Auth
+  alias Teiserver.Account.User
+  alias Teiserver.Config
+  alias Teiserver.Helpers.BurstyRateLimiter
+  use GenServer
+  require Logger
+
+  @typep member :: %{pid: pid(), mon_ref: reference(), user_id: User.id()}
+  @typep state :: %{
+           tick_timer_ref: :timer.tref() | nil,
+           total_limit: non_neg_integer(),
+           queue: :queue.queue(member()),
+           monitors: MapSet.t(pid()),
+           rate_limiter: BurstyRateLimiter.t()
+         }
+
+  @default_tick_period 1_000
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl GenServer
+  @spec init(term()) :: {:ok, state()}
+  def init(_args) do
+    Logger.metadata(actor_id: "LoginThrottleServer")
+    {:ok, timer_ref} = :timer.send_interval(@default_tick_period, :tick)
+    default_rate = Config.get_site_config_cache("system.Login rate")
+    rate_limiter = BurstyRateLimiter.per_second(default_rate) |> BurstyRateLimiter.set_empty()
+
+    state = %{
+      tick_timer_ref: timer_ref,
+      total_limit: Config.get_site_config_cache("system.User limit"),
+      queue: :queue.new(),
+      monitors: MapSet.new(),
+      rate_limiter: rate_limiter
+    }
+
+    {:ok, state}
+  end
+
+  @spec get_queue_length :: non_neg_integer()
+  def get_queue_length do
+    GenServer.call(__MODULE__, :queue_size)
+  catch
+    :exit, {:noproc, _call} -> 0
+  end
+
+  @doc """
+  This is the function call used as part of login attempts.
+  """
+  @spec attempt_login(pid(), User.id()) :: boolean()
+  def attempt_login(pid, userid) do
+    GenServer.call(__MODULE__, {:attempt_login, pid, userid})
+  end
+
+  def set_login_limit(limit) do
+    GenServer.call(__MODULE__, {:set_login_limit, limit})
+  end
+
+  @doc """
+  Reset the rate limiter to a new rate (user / second).
+  If should_fill? is true, the new rate limiter will be flush with permits and
+  will let players in right away.
+  """
+  def reset_rate_limiter(%BurstyRateLimiter{} = rl) do
+    GenServer.call(__MODULE__, {:reset_rate_limiter, rl})
+  end
+
+  @spec reset_rate_limiter(rate :: non_neg_integer(), should_fill? :: boolean()) :: :ok
+  def reset_rate_limiter(rate, should_fill? \\ false) when is_number(rate) do
+    rl = BurstyRateLimiter.per_second(rate)
+
+    rl =
+      if should_fill?, do: BurstyRateLimiter.set_full(rl), else: BurstyRateLimiter.set_empty(rl)
+
+    reset_rate_limiter(rl)
+  end
+
+  @doc """
+  Set to :infinity to effectively disable the queue (used for test)
+  """
+  @spec set_tick_period(non_neg_integer() | :infinity) :: :ok
+  def set_tick_period(new_interval) do
+    GenServer.cast(__MODULE__, {:set_tick_period, new_interval})
+  end
+
+  @doc """
+  used for test, to trigger the login
+  """
+  def tick do
+    Process.whereis(__MODULE__) |> send(:tick)
+  end
+
+  @doc """
+  Used for tests, terminate and restart the genserver
+  """
+  def restart do
+    :ok = Supervisor.terminate_child(Teiserver.Supervisor, __MODULE__)
+    Supervisor.restart_child(Teiserver.Supervisor, __MODULE__)
+  end
+
+  @impl GenServer
+  def handle_call(:queue_size, _from, state) do
+    result = :queue.len(state.queue)
+    {:reply, result, state}
+  end
+
+  def handle_call({:attempt_login, pid, userid}, _from, state) do
+    category = categorise_user(userid)
+    capacity = get_capacity(state.total_limit)
+
+    {new_state, can_login?} =
+      cond do
+        category == :instant ->
+          {state, true}
+
+        capacity > 0 && :queue.is_empty(state.queue) ->
+          case BurstyRateLimiter.try_acquire(state.rate_limiter) do
+            {:ok, updated_rl} -> {%{state | rate_limiter: updated_rl}, true}
+            _error -> {add_user_to_queue(state, pid, userid), false}
+          end
+
+        true ->
+          {add_user_to_queue(state, pid, userid), false}
+      end
+
+    {:reply, can_login?, new_state}
+  end
+
+  def handle_call({:reset_rate_limiter, %BurstyRateLimiter{} = rl}, _from, state) do
+    {:reply, :ok, %{state | rate_limiter: rl}}
+  end
+
+  def handle_call({:set_login_limit, limit}, _from, state) do
+    {:reply, :ok, %{state | total_limit: limit}}
+  end
+
+  @impl GenServer
+  def handle_info(:tick, state) do
+    capacity = get_capacity(state.total_limit)
+
+    if capacity <= 0 do
+      {:noreply, state}
+    else
+      new_state = dequeue_users(capacity, state)
+      {:noreply, new_state}
+    end
+  end
+
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
+    # don't traverse the queue to remove the member since it's a relatively
+    # expensive operation.
+    # This means the queue length doesn't reflect live clients, but it's
+    # not too important in my opinion
+    state = Map.update!(state, :monitors, &MapSet.delete(&1, pid))
+    {:noreply, state}
+  end
+
+  @impl GenServer
+  def handle_cast({:set_tick_period, new_period}, state) do
+    if state.tick_timer_ref do
+      :timer.cancel(state.tick_timer_ref)
+    end
+
+    if new_period == :infinity do
+      {:noreply, %{state | tick_timer_ref: nil}}
+    else
+      tick_timer_ref = :timer.send_interval(new_period, :tick)
+      {:noreply, %{state | tick_timer_ref: tick_timer_ref}}
+    end
+  end
+
+  # If a user isn't allowed to login right away they need to be queued up
+  # this function takes care of all the work around that
+  @spec add_user_to_queue(state(), pid(), User.id()) :: state()
+  defp add_user_to_queue(state, pid, user_id) do
+    member = %{pid: pid, mon_ref: Process.monitor(pid), user_id: user_id}
+
+    state
+    |> Map.update!(:queue, &:queue.in(member, &1))
+    |> Map.update!(:monitors, &MapSet.put(&1, pid))
+  end
+
+  defp dequeue_users(n, state) when n <= 0, do: state
+
+  defp dequeue_users(n, state) do
+    case :queue.out(state.queue) do
+      {:empty, _queue} ->
+        state
+
+      {{:value, member}, rest} ->
+        Process.demonitor(member.mon_ref)
+        member_still_connected? = MapSet.member?(state.monitors, member.pid)
+
+        new_state =
+          state
+          |> Map.update!(:monitors, &MapSet.delete(&1, member.pid))
+          |> Map.replace!(:queue, rest)
+
+        if member_still_connected? do
+          case BurstyRateLimiter.try_acquire(state.rate_limiter) do
+            {:ok, rl} ->
+              new_state = Map.replace!(new_state, :rate_limiter, rl)
+              send(member.pid, {:login_accepted, member.user_id})
+              dequeue_users(n - 1, new_state)
+
+            _error ->
+              state
+          end
+        else
+          dequeue_users(n, new_state)
+        end
+    end
+  end
+
+  # some users should be able to bypass the login queue altogether.
+  # Either for operational reasons: bots like spads should never be kept out
+  # or for marketing reason: vips, server operators, mods and whatnot
+  # there aren't many of these users, so allowing them doesn't have a big impact
+  @spec categorise_user(User.id()) :: atom
+  defp categorise_user(userid) do
+    if Auth.has_any_role?(userid, ["Bot", "Contributor", "VIP", "BAR+"]) do
+      :instant
+    else
+      :standard
+    end
+  end
+
+  defp get_capacity(total_limit) do
+    count = Account.count_non_bot_clients()
+    total_limit - count
+  end
+end

@@ -1,0 +1,137 @@
+<% {_fg, _bg, bsname} = view_colour() |> colours() %>
+
+<script type="text/javascript" charset="utf-8">
+  $(function() {
+    $('.datepicker').datepicker({
+      format: "dd/mm/yyyy"
+    });
+  });
+</script>
+
+<% search_col_class = "col-md-4 col-lg-3 col-xl-2 col-xxl-1 my-2" %>
+
+<div class="search-row pt-3">
+  <div class={"btn btn-outline-#{bsname}"} onclick="show_search();" id="search-box-shower">
+    <i class="fa-solid fa-fw fa-search"></i> Show search form
+  </div>
+
+  <form
+    action={~p"/teiserver/admin/users/search"}
+    method="post"
+    class="form-horizontal"
+    id="search-box"
+    style="display: none;"
+  >
+    <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+
+    <div class="row">
+      <div class={search_col_class}>
+        <label for="search_name" class="control-label">Name/Email: </label>
+        <input
+          type="text"
+          name="search[name]"
+          id="search_name"
+          value={@params["name"]}
+          placeholder=""
+          class="form-control"
+        />
+      </div>
+
+      <div class={search_col_class}>
+        <label for="search_role" class="control-label">Role: </label>
+        <input
+          type="text"
+          name="search[role]"
+          id="search_role"
+          value={@params["role"]}
+          placeholder=""
+          class="form-control"
+        />
+      </div>
+
+      <div class={search_col_class}>
+        <label for="search_limit" class="control-label">Limit: </label>
+        <input
+          type="text"
+          name="search[limit]"
+          id="search_limit"
+          value={@params["limit"]}
+          placeholder=""
+          class="form-control"
+        />
+      </div>
+
+      <div class={search_col_class}>
+        <.input
+          type="select"
+          id="search_order"
+          name="search[order]"
+          label="Order by"
+          value={@params["order"] || "Name (A-Z)"}
+          options={[
+            "Last logged in",
+            "Name (A-Z)",
+            "Name (Z-A)",
+            "Newest first",
+            "Oldest first"
+          ]}
+        />
+      </div>
+
+      <div class={search_col_class}>
+        <.input
+          type="select"
+          id="search_mod_action"
+          name="search[mod_action]"
+          label="Order by"
+          value={@params["mod_action"]}
+          options={[
+            "Any user",
+            "Banned",
+            "Muted",
+            "Warned",
+            "Shadowbanned"
+          ]}
+        />
+      </div>
+
+      <div class={search_col_class}>
+        <label for="search_lobby_client" class="control-label">Lobby: </label>
+        <input
+          type="text"
+          name="search[lobby_client]"
+          id="search_lobby_client"
+          value={@params["lobby_client"]}
+          placeholder=""
+          class="form-control"
+        />
+      </div>
+
+      <div class={search_col_class}>
+        <label for="search_previous_names" class="control-label">
+          Current/Previous names: (case sensitive)
+        </label>
+        <input
+          type="text"
+          name="search[previous_names]"
+          id="search_previous_names"
+          value={@params["previous_names"]}
+          placeholder=""
+          class="form-control"
+        />
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="offset-md-8 col-md-4 offset-xl-10 col-xl-2">
+        &nbsp;<br />
+        <input
+          type="submit"
+          value="Search"
+          name="form.submitted"
+          class={"btn btn-#{bsname} btn-block"}
+        />
+      </div>
+    </div>
+  </form>
+</div>

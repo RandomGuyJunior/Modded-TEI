@@ -1,0 +1,56 @@
+defmodule Teiserver.Telemetry.SimpleMatchEventTest do
+  @moduledoc false
+
+  alias Ecto.Adapters.SQL
+  alias ExULID.ULID
+  alias Teiserver.Battle
+  alias Teiserver.TeiserverTestLib
+  alias Teiserver.Telemetry
+  use Teiserver.DataCase
+
+  test "simple match events" do
+    r = :rand.uniform(999_999_999)
+
+    user = TeiserverTestLib.new_user("simple_match_event")
+
+    {:ok, match} =
+      Battle.create_match(%{
+        uuid: ULID.generate(),
+        map: "red desert",
+        data: %{},
+        tags: %{},
+        team_count: 2,
+        team_size: 2,
+        passworded: false,
+        game_type: "Team",
+        founder_id: user.id,
+        founder_name: user.name,
+        server_uuid: "#{r}",
+        bots: %{},
+        started: DateTime.shift(DateTime.utc_now(), minute: -30),
+        finished: DateTime.shift(DateTime.utc_now(), second: -30)
+      })
+
+    # Start by removing all match events
+    query = "DELETE FROM telemetry_simple_match_events;"
+    SQL.query(Repo, query, [])
+    assert Telemetry.list_simple_match_events() |> Enum.count() == 0
+
+    # Log the event
+    {result, _event} =
+      Telemetry.log_simple_match_event(user.id, match.id, "match.simple_user_event-#{r}", 100)
+
+    assert result == :ok
+
+    assert Telemetry.list_simple_match_events() |> Enum.count() == 1
+    assert Telemetry.list_simple_match_events(where: [user_id: user.id]) |> Enum.count() == 1
+    assert Telemetry.list_simple_match_events(where: [match_id: match.id]) |> Enum.count() == 1
+
+    # Ensure the match event types exist too
+    type_list =
+      Telemetry.list_simple_match_event_types()
+      |> Enum.map(fn %{name: name} -> name end)
+
+    assert Enum.member?(type_list, "match.simple_user_event-#{r}")
+  end
+end

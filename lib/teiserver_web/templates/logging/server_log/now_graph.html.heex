@@ -1,0 +1,147 @@
+<% bsname = view_colour() %>
+
+<script src={~p"/js/d3.js"}>
+</script>
+<script src={~p"/js/c3.min.js"}>
+</script>
+
+<link href="/css/c3.min.css" rel="stylesheet" />
+
+<style>
+  .chart-div {
+    margin: 0 0 15px 0;
+    padding-bottom: 10px;
+    height: 20vh;
+    border-bottom: 1px solid #555;
+  }
+</style>
+
+<script>
+  function c3_chart (elem, data) {
+    c3.generate({
+      bindto: elem,
+      data: {
+        x: 'x',
+        xFormat: '%Y-%m-%d %H:%M:%S',
+        columns: data
+      },
+      axis: {
+        x: {
+          type: 'timeseries',
+          tick: {
+            format: '%d %H:%M:%S'
+          }
+        },
+        y: {
+          min: 0,
+          padding: {
+            top: 15,
+            bottom: 0
+          }
+        }
+      }
+    });
+  }
+
+  $(function() {
+    setTimeout("location.reload(true);", 60000);
+
+    c3_chart('#chart_players', <%= raw Jason.encode!([["x" | @axis_key] | @columns_players]) %>);
+    c3_chart('#chart_matches', <%= raw Jason.encode!([["x" | @axis_key] | @columns_matches]) %>);
+    c3_chart('#chart_matches_start_stop', <%= raw Jason.encode!([["x" | @axis_key] | @columns_matches_start_stop]) %>);
+    c3_chart('#chart_user_connections', <%= raw Jason.encode!([["x" | @axis_key] | @columns_user_connections]) %>);
+    c3_chart('#chart_bot_connections', <%= raw Jason.encode!([["x" | @axis_key] | @columns_bot_connections]) %>);
+    c3_chart('#chart_cpu', <%= raw Jason.encode!([["x" | @axis_key] | @columns_cpu_load]) %>);
+  });
+</script>
+
+{render(
+  TeiserverWeb.Logging.GeneralView,
+  "sub_menu.html",
+  Map.merge(assigns, %{active: "server"})
+)}
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <TeiserverWeb.Components.Logging.ServerViewLogComponents.section_menu
+          active="now"
+          colour={bsname}
+        />
+        <br /><br />
+
+        <div class="row">
+          <div class="col-md-12">
+            <div class={"card border-#{bsname}"}>
+              <div class="card-body">
+                <div class="row">
+                  <form action={~p"/logging/server/now"} method="get" class="">
+                    <div class="row">
+                      <div class="col-lg-5 col-md-12 my-3">
+                        <.input
+                          type="select"
+                          id="minutes"
+                          name="minutes"
+                          label="Minutes"
+                          value={Map.get(@params, "minutes", "30")}
+                          options={[
+                            {"5", "5"},
+                            {"30", "30"},
+                            {"60", "60"},
+                            {"180 (3 hours)", "180"},
+                            {"720 (12 hours)", "720"},
+                            {"1440 (24 hours)", "1440"}
+                          ]}
+                        />
+                      </div>
+
+                      <div class="col-lg-5 col-md-12 my-3">
+                        <.input
+                          type="select"
+                          id="resolution"
+                          name="resolution"
+                          label="Resolution (minutes per point)"
+                          value={Map.get(@params, "resolution", "1")}
+                          options={[
+                            "1",
+                            "5",
+                            "30",
+                            "60"
+                          ]}
+                        />
+                      </div>
+
+                      <div class="col-lg-2 col-md-12 my-3">
+                        &nbsp;<br />
+                        <button type="submit" class={"btn btn-#{bsname} btn-block"}>
+                          Update
+                        </button>
+                      </div>
+                    </div>
+                  </form>
+
+                  <div class="col-md-12 col-lg-6">
+                    <div id="chart_players" class="with-transitions chart-div"></div>
+
+                    <div id="chart_matches" class="with-transitions chart-div"></div>
+
+                    <div id="chart_matches_start_stop" class="with-transitions chart-div"></div>
+                  </div>
+
+                  <div class="col-md-12 col-lg-6">
+                    <div id="chart_user_connections" class="with-transitions chart-div"></div>
+
+                    <div id="chart_bot_connections" class="with-transitions chart-div"></div>
+
+                    <div id="chart_cpu" class="with-transitions chart-div"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

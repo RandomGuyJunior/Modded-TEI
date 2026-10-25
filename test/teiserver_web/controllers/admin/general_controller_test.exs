@@ -1,0 +1,17 @@
+defmodule TeiserverWeb.Admin.GeneralControllerTest do
+  alias Teiserver.Helpers.GeneralTestLib
+  alias Teiserver.TeiserverTestLib
+
+  use TeiserverWeb.ConnCase
+
+  setup do
+    GeneralTestLib.conn_setup(TeiserverTestLib.admin_permissions())
+    |> TeiserverTestLib.conn_setup()
+  end
+
+  test "index", %{conn: conn} do
+    conn = get(conn, ~p"/admin")
+
+    assert html_response(conn, 200) =~ "Users"
+  end
+end

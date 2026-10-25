@@ -1,0 +1,29 @@
+<div class="row page-row">
+  <.menu_card
+    icon={Teiserver.Lobby.icon()}
+    icon_class="fa-solid"
+    url={~p"/battle/lobbies"}
+  >
+    Lobbies
+  </.menu_card>
+
+  <%= if allow?(@conn, "admin.dev") do %>
+    <.menu_card
+      icon={Teiserver.Battle.MatchLib.icon()}
+      icon_class="fa-solid"
+      url={~p"/battle"}
+    >
+      Battle logs
+    </.menu_card>
+  <% end %>
+</div>
+
+<div class="row page-row">
+  <.menu_card
+    icon_class="fa-solid"
+    icon={StylingHelper.icon(:back)}
+    url={~p"/"}
+  >
+    Back
+  </.menu_card>
+</div>

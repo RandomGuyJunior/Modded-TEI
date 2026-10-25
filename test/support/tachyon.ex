@@ -1,0 +1,683 @@
+defmodule Teiserver.Support.Tachyon do
+  @moduledoc false
+  alias ExUnit.Callbacks
+  alias Teiserver.Account
+  alias Teiserver.Autohost
+  alias Teiserver.BotFixtures
+  alias Teiserver.Game
+  alias Teiserver.Game.MatchRatingLib
+  alias Teiserver.Helpers.Collections
+  alias Teiserver.Helpers.GeneralTestLib
+  alias Teiserver.OAuthFixtures
+  alias Teiserver.Support.Polling
+  alias Teiserver.Tachyon
+  alias Teiserver.Tachyon.Schema
+  alias WebsocketSyncClient, as: WSC
+
+  def tachyon_case_setup(tags) do
+    if tags[:module] |> to_string() |> String.contains?("Tachyon") || tags[:tachyon] do
+      Tachyon.disable_state_restoration()
+      Tachyon.restart_system()
+
+      # this reduces the noise when processes attempt to do sql when the test
+      # and the sandbox with it are already wound down
+      Callbacks.on_exit(fn ->
+        Supervisor.terminate_child(Teiserver.Supervisor, Tachyon.System)
+      end)
+    end
+  end
+
+  def create_user do
+    user = GeneralTestLib.make_user(%{"roles" => ["Verified"]})
+    set_ratings(user, 17)
+    user
+  end
+
+  @spec set_rating(Account.User.t(), rating_type :: String.t(), number() | map()) ::
+          Account.Rating.t()
+  def set_rating(user, rating_type, r) do
+    rating = Game.get_rating_type_by_name!(rating_type)
+    [r] = set_ratings(user, [{rating, r}])
+    r
+  end
+
+  @spec set_ratings(
+          Account.User.t(),
+          rating :: number() | [{Game.RatingType.t(), number() | map()}]
+        ) :: [Account.Rating.t()]
+  @doc """
+  Set rating for all game type for this user
+  """
+  def set_ratings(user, r) when is_number(r) do
+    ratings =
+      Game.list_rating_types()
+      |> Enum.map(fn rating -> {rating, r} end)
+
+    set_ratings(user, ratings)
+  end
+
+  def set_ratings(user, ratings) when is_list(ratings) do
+    for {rating_type, attrs} <- ratings do
+      attrs =
+        if is_number(attrs),
+          do: %{skill: attrs},
+          else: attrs
+
+      attrs =
+        Map.merge(
+          %{
+            user_id: user.id,
+            rating_type_id: rating_type.id,
+            rating_value: attrs.skill,
+            uncertainty: 1.0,
+            leaderboard_rating: 10,
+            last_updated: DateTime.utc_now(),
+            season: MatchRatingLib.active_season()
+          },
+          attrs
+        )
+
+      {:ok, r} = Account.create_or_update_rating(attrs)
+      r
+    end
+  end
+
+  def setup_client(_context), do: setup_client()
+
+  def setup_client do
+    user = create_user()
+    %{client: client, token: token} = connect(user)
+    {:ok, user: user, client: client, token: token}
+  end
+
+  # for when you only need an oauth app
+  def setup_app(_context) do
+    owner = GeneralTestLib.make_user(%{"roles" => ["Verified"]})
+
+    app =
+      OAuthFixtures.app_attrs(owner.id)
+      |> Map.put(:uid, UUID.uuid4())
+      |> OAuthFixtures.create_app()
+
+    {:ok, app: app}
+  end
+
+  def setup_autohost(context) do
+    autohost = BotFixtures.create_bot()
+
+    token =
+      OAuthFixtures.token_attrs(autohost, context.app)
+      |> OAuthFixtures.create_token()
+
+    client = connect_autohost!(token, 10, 0)
+    Callbacks.on_exit(fn -> cleanup_connection(client, token) end)
+    {:ok, autohost: autohost, autohost_client: client}
+  end
+
+  @doc """
+  connects the given user and returns the ws client
+  """
+  def connect(x, opts \\ [swallow_first_event: true])
+
+  def connect(%Teiserver.OAuth.Token{} = token, opts) do
+    connect_opts =
+      connect_options(token)
+      |> Keyword.put_new(:default_timeout, 300)
+
+    {:ok, client} = WSC.connect(tachyon_url(), connect_opts)
+
+    # by default, swallow the user/updated event sent at login
+    swallow = Keyword.get(opts, :swallow_first_event, true)
+
+    if swallow and not is_nil(token.owner_id) do
+      {:ok, _user_updated} = recv_message(client)
+    end
+
+    Callbacks.on_exit(fn -> cleanup_connection(client, token) end)
+    client
+  end
+
+  def connect(user, opts) do
+    %{token: token} = OAuthFixtures.setup_token(user)
+
+    client = connect(token, opts)
+    %{client: client, token: token}
+  end
+
+  # used for on_exit callback and make sure nothing is lingering after the test
+  def cleanup_connection(client, _token) do
+    WSC.disconnect(client)
+  end
+
+  @doc """
+  Connect as an autohost and ensure the first `status` event is sent
+  """
+  def connect_autohost!(token, max_battles, current) do
+    client = connect(token)
+
+    :ok =
+      send_event(client, "autohost/status", %{
+        maxBattles: max_battles,
+        currentBattles: current
+      })
+
+    %{"type" => "request", "commandId" => "autohost/subscribeUpdates"} =
+      request = recv_message!(client)
+
+    :ok = send_response(client, request, data: %{})
+
+    Polling.poll_until_true(fn ->
+      case Autohost.lookup_autohost(token.bot_id) do
+        nil -> false
+        {_pid, val} -> val.max_battles == max_battles && val.current_battles == current
+      end
+    end)
+
+    client
+  end
+
+  def connect_options(token) do
+    [
+      connection_options: [
+        extra_headers: [
+          {"authorization", "Bearer #{token.value}"},
+          {"sec-websocket-protocol", "v0.tachyon"}
+        ]
+      ]
+    ]
+  end
+
+  def tachyon_url do
+    conf = Application.get_env(:teiserver, TeiserverWeb.Endpoint)
+    "ws://#{conf[:url][:host]}:#{conf[:http][:port]}/tachyon"
+  end
+
+  # TODO tachyon_mvp: add a json validation here to make sure the request
+  # sent there is conforming
+  def request(command_id, data \\ nil) do
+    req = %{
+      type: :request,
+      commandId: command_id,
+      messageId: UUID.uuid4()
+    }
+
+    if is_nil(data) do
+      req
+    else
+      Map.put(req, :data, data)
+    end
+  end
+
+  def response(request, opts) do
+    resp = %{
+      type: :response,
+      commandId: request["commandId"],
+      messageId: request["messageId"]
+    }
+
+    cond do
+      not is_nil(opts[:data]) ->
+        resp
+        |> Map.put(:status, :success)
+        |> Map.put(:data, opts[:data])
+
+      not is_nil(opts[:reason]) ->
+        resp =
+          resp
+          |> Map.put(:status, :failed)
+          |> Map.put(:reason, opts[:reason])
+
+        case opts[:details] do
+          nil -> resp
+          x -> Map.put(resp, :details, x)
+        end
+
+      true ->
+        Map.put(resp, :status, :success)
+    end
+  end
+
+  def event(command_id, data \\ nil) do
+    request(command_id, data) |> Map.put(:type, :event)
+  end
+
+  def send_request(client, command_id, data \\ nil) do
+    WSC.send_message(client, {:text, request(command_id, data) |> Jason.encode!()})
+  end
+
+  def send_response(client, request, opts \\ []) do
+    WSC.send_message(
+      client,
+      {:text, response(request, opts) |> Jason.encode!()}
+    )
+  end
+
+  def send_event(client, command_id, data \\ nil) do
+    WSC.send_message(client, {:text, event(command_id, data) |> Jason.encode!()})
+  end
+
+  def recv_message(client, opts \\ []) do
+    opts = Keyword.put_new(opts, :timeout, 300)
+
+    case WSC.recv(client, opts) do
+      {:ok, {:text, resp}} ->
+        with decoded <- Jason.decode!(resp),
+             {:ok, cmd_id, message_type, _msg_id} <-
+               Schema.parse_envelope(decoded),
+             :ok <- Schema.parse_message(cmd_id, message_type, decoded) do
+          {:ok, decoded}
+        else
+          {:error, %JsonXema.ValidationError{} = err} ->
+            resp |> Jason.decode!() |> IO.inspect(label: "schema validation failed on")
+            {:error, err}
+
+          err ->
+            resp |> Jason.decode!() |> IO.inspect(label: "schema validation failed on")
+
+            IO.inspect(err, label: "unknown error")
+            err
+        end
+
+      other ->
+        other
+    end
+  end
+
+  def recv_message!(client, opts \\ []) do
+    {:ok, resp} = recv_message(client, opts)
+    resp
+  end
+
+  @doc """
+  simple function to receive all message for a connection. Returns the list of
+  received messages when there's the first timeout.
+  """
+  def drain(client, recv_opts \\ []) do
+    drain(client, recv_opts, [])
+  end
+
+  defp drain(client, recv_opts, messages) do
+    case recv_message(client, recv_opts) do
+      {:ok, msg} -> drain(client, recv_opts, [msg | messages])
+      {:error, :timeout} -> Enum.reverse(messages)
+    end
+  end
+
+  @doc """
+  Cleanly disconnect a client by sending a disconnect message before closing
+  the connection.
+  """
+  def disconnect!(client) do
+    req = request("system/disconnect")
+    :ok = WSC.send_message(client, {:text, req |> Jason.encode!()})
+    :ok = WSC.disconnect(client)
+  end
+
+  @doc """
+  Close the underlying websocket connection without sending the proper message.
+  This can be used to simulate a player crash.
+  """
+  def abrupt_disconnect!(client) do
+    :ok = WSC.disconnect(client)
+  end
+
+  @doc """
+  high level function to get the list of matchmaking queues
+  """
+  def list_queues!(client) do
+    req = request("matchmaking/list")
+    :ok = WSC.send_message(client, {:text, req |> Jason.encode!()})
+    {:ok, resp} = recv_message(client)
+
+    message_id = req.messageId
+
+    # This checks the server replies with the correct message_id
+    # it only needs to be done once in the test suite so might as well put
+    # put it here since this is the first request implemented
+    # This could (should?) be moved elsewhere later
+    %{
+      "type" => "response",
+      "messageId" => ^message_id,
+      "commandId" => "matchmaking/list",
+      "status" => "success"
+    } = resp
+
+    resp
+  end
+
+  def join_queues!(client, queues) do
+    req = request("matchmaking/queue", %{queues: queues})
+    :ok = WSC.send_message(client, {:text, req |> Jason.encode!()})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def leave_queues!(client) do
+    req = request("matchmaking/cancel")
+    :ok = WSC.send_message(client, {:text, req |> Jason.encode!()})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def matchmaking_ready!(client) do
+    req = request("matchmaking/ready")
+    :ok = WSC.send_message(client, {:text, req |> Jason.encode!()})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def server_stats!(client) do
+    req = request("system/serverStats")
+    :ok = WSC.send_message(client, {:text, req |> Jason.encode!()})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def send_message!(client, message, target) do
+    :ok =
+      send_request(client, "messaging/send", %{
+        message: message,
+        target: target
+      })
+
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def send_dm!(client, message, player_id) do
+    send_message!(client, message, %{type: "player", userId: to_string(player_id)})
+  end
+
+  def send_party_message(client, message) do
+    send_message!(client, message, %{type: :party})
+  end
+
+  def send_lobby_message(client, message) do
+    send_message!(client, message, %{type: :lobby})
+  end
+
+  def subscribe_messaging!(client, opts \\ []) do
+    since = Keyword.get(opts, :since, %{type: "latest"})
+    :ok = send_request(client, "messaging/subscribeReceived", %{since: since})
+    recv_message!(client)
+  end
+
+  def user_info!(client, user_id) do
+    :ok = send_request(client, "user/info", %{userId: to_string(user_id)})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def friend_list!(client) do
+    :ok = send_request(client, "friend/list")
+    recv_message!(client)
+  end
+
+  def send_friend_request!(client, user_id) do
+    :ok = send_request(client, "friend/sendRequest", %{to: to_string(user_id)})
+    recv_message!(client)
+  end
+
+  def accept_friend_request!(client, from_id) do
+    :ok = send_request(client, "friend/acceptRequest", %{from: to_string(from_id)})
+    recv_message!(client)
+  end
+
+  def reject_friend_request!(client, from_id) do
+    :ok = send_request(client, "friend/rejectRequest", %{from: to_string(from_id)})
+    recv_message!(client)
+  end
+
+  def cancel_friend_request!(client, user_id) do
+    :ok = send_request(client, "friend/cancelRequest", %{to: to_string(user_id)})
+    recv_message!(client)
+  end
+
+  def remove_friend!(client, friend_id) do
+    :ok = send_request(client, "friend/remove", %{userId: to_string(friend_id)})
+    recv_message!(client)
+  end
+
+  def subscribe_updates!(client, user_ids) do
+    :ok =
+      send_request(client, "user/subscribeUpdates", %{userIds: Enum.map(user_ids, &to_string/1)})
+
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def unsubscribe_updates!(client, user_ids) do
+    :ok = send_request(client, "user/unsubscribeUpdates", %{userIds: user_ids})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def create_party!(client) do
+    :ok = send_request(client, "party/create")
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def leave_party!(client) do
+    :ok = send_request(client, "party/leave")
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def invite_to_party!(client, user_id) do
+    :ok = send_request(client, "party/invite", %{userId: to_string(user_id)})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def accept_party_invite!(client, party_id) do
+    :ok = send_request(client, "party/acceptInvite", %{partyId: party_id})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def decline_party_invite!(client, party_id) do
+    :ok = send_request(client, "party/declineInvite", %{partyId: party_id})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def cancel_party_invite!(client, user_id) do
+    :ok = send_request(client, "party/cancelInvite", %{userId: to_string(user_id)})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def kick_player_from_party!(client, target_id) do
+    :ok = send_request(client, "party/kickMember", %{userId: to_string(target_id)})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def autohost_send_update_event(client, data) do
+    :ok = send_event(client, "autohost/update", data)
+  end
+
+  def autohost_finished(battle_id, user_id, winning_ally_teams),
+    do: %{
+      battleId: battle_id,
+      time: DateTime.utc_now() |> DateTime.to_unix(:microsecond),
+      update: %{type: :finished, userId: user_id, winningAllyTeams: winning_ally_teams}
+    }
+
+  def autohost_engine_quit(battle_id),
+    do: %{
+      battleId: battle_id,
+      time: DateTime.utc_now() |> DateTime.to_unix(:microsecond),
+      update: %{type: :engine_quit}
+    }
+
+  def create_lobby!(client, lobby_data) do
+    mapping = %{
+      name: :name,
+      map_name: :mapName,
+      ally_team_config: :allyTeamConfig,
+      boss_enabled?: :areBossesEnabled,
+      game_options:
+        {:gameOptions, &(Enum.map(&1, fn {k, v} -> {k, %{value: v}} end) |> Enum.into(%{}))},
+      tags: :tags
+    }
+
+    data = Collections.transform_map(lobby_data, mapping)
+    :ok = send_request(client, "lobby/create", data)
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  @doc """
+  utility function to help create simple ally team config.
+  For example: mk_ally_team_config(2, 1) for a duel setting
+  """
+  def mk_ally_team_config(n_ally_team, n_team) do
+    for _i <- 1..n_ally_team do
+      teams = for _j <- 1..n_team, do: %{maxPlayers: 1}
+
+      %{
+        maxTeams: n_team,
+        startBox: %{top: 0, bottom: 1, left: 0, right: 1},
+        teams: teams
+      }
+    end
+  end
+
+  def join_lobby!(client, lobby_id) do
+    :ok = send_request(client, "lobby/join", %{id: lobby_id})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def leave_lobby!(client) do
+    :ok = send_request(client, "lobby/leave")
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def join_ally_team!(client, ally_team) do
+    :ok = send_request(client, "lobby/joinAllyTeam", %{allyTeam: ally_team})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def spectate!(client) do
+    :ok = send_request(client, "lobby/spectate")
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def lobby_join_queue!(client) do
+    :ok = send_request(client, "lobby/joinQueue")
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def lobby_add_bot!(client, ally_team, short_name, opt_data) do
+    data =
+      %{
+        allyTeam: ally_team,
+        shortName: short_name,
+        name: opt_data[:name],
+        version: opt_data[:version],
+        options: opt_data[:options]
+      }
+      |> Enum.filter(&(elem(&1, 1) != nil))
+      |> Map.new()
+
+    :ok = send_request(client, "lobby/addBot", data)
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def lobby_remove_bot!(client, bot_id) do
+    :ok = send_request(client, "lobby/removeBot", %{id: bot_id})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def lobby_update_bot!(client, bot_id, data) do
+    update_data =
+      Enum.reduce(
+        [{:name, :name}, {:short_name, :shortName}, {:version, :version}, {:options, :options}],
+        %{id: bot_id},
+        fn
+          {k, tk}, m ->
+            if Keyword.has_key?(data, k) do
+              Map.put(m, tk, data[k])
+            else
+              m
+            end
+        end
+      )
+
+    :ok = send_request(client, "lobby/updateBot", update_data)
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def lobby_start_battle!(client) do
+    :ok = send_request(client, "lobby/startBattle")
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def lobby_update!(client, update_data) do
+    :ok = send_request(client, "lobby/update", update_data)
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def lobby_appoint_boss(client, user_id) do
+    :ok = send_request(client, "lobby/appointBoss", %{userId: to_string(user_id)})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def lobby_unboss(client, user_id \\ nil) do
+    uid = if user_id, do: to_string(user_id), else: nil
+    :ok = send_request(client, "lobby/unboss", %{userId: uid})
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def lobby_kickban(client, user_id, ban_until \\ nil) do
+    data = %{userId: to_string(user_id)}
+
+    data =
+      if ban_until,
+        do: Map.put(data, :banUntil, DateTime.to_unix(ban_until, :microsecond)),
+        else: data
+
+    :ok = send_request(client, "lobby/kickban", data)
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def lobby_update_client_status(client, update_data) do
+    :ok = send_request(client, "lobby/updateClientStatus", update_data)
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def lobby_vote_submit(client, vote_id, ballot) do
+    data = %{"id" => vote_id, "vote" => ballot}
+    :ok = send_request(client, "lobby/voteSubmit", data)
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def subscribe_lobby_list!(client) do
+    :ok = send_request(client, "lobby/subscribeList")
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def unsubscribe_lobby_list!(client) do
+    :ok = send_request(client, "lobby/unsubscribeList")
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+end

@@ -1,0 +1,209 @@
+{
+    "$id": "https://schema.beyondallreason.dev/tachyon/definitions/lobbyDetails.json",
+    "title": "LobbyDetails",
+    "description": "The full state of a lobby",
+    "type": "object",
+    "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "mapName": { "type": "string" },
+        "engineVersion": { "type": "string" },
+        "gameVersion": { "type": "string" },
+        "gameOptions": {
+            "description": "object indexed by the game option key",
+            "type": "object",
+            "patternProperties": {
+                "^.*$": {
+                    "type": "object",
+                    "properties": { "value": { "type": "string" } },
+                    "required": ["value"]
+                }
+            }
+        },
+        "allyTeamConfig": {
+            "type": "object",
+            "patternProperties": {
+                "^.*$": {
+                    "description": "this represent an array, items should be sorted lexicographically on their keys",
+                    "type": "object",
+                    "properties": {
+                        "startBox": { "$ref": "../definitions/startBox.json" },
+                        "maxTeams": { "type": "integer", "minimum": 1 },
+                        "teams": {
+                            "type": "object",
+                            "patternProperties": {
+                                "^.*$": {
+                                    "type": "object",
+                                    "properties": {
+                                        "maxPlayers": {
+                                            "type": "integer",
+                                            "minimum": 1
+                                        }
+                                    },
+                                    "required": ["maxPlayers"]
+                                }
+                            }
+                        }
+                    },
+                    "required": ["startBox", "maxTeams", "teams"]
+                }
+            }
+        },
+        "areBossesEnabled": { "type": "boolean" },
+        "bosses": {
+            "type": "object",
+            "patternProperties": {
+                "^.*$": { "type": "object", "properties": {} }
+            }
+        },
+        "players": {
+            "type": "object",
+            "patternProperties": {
+                "^.*$": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "$ref": "../definitions/userId.json" },
+                        "allyTeam": { "type": "string" },
+                        "team": { "type": "string" },
+                        "player": { "type": "string" },
+                        "isReady": { "type": "boolean" },
+                        "assetStatus": {
+                            "enum": ["missing", "downloading", "complete"]
+                        }
+                    },
+                    "required": [
+                        "id",
+                        "allyTeam",
+                        "team",
+                        "player",
+                        "isReady",
+                        "assetStatus"
+                    ]
+                }
+            }
+        },
+        "spectators": {
+            "type": "object",
+            "patternProperties": {
+                "^.*$": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "$ref": "../definitions/userId.json" },
+                        "joinQueuePosition": { "type": "number" }
+                    },
+                    "required": ["id"]
+                }
+            }
+        },
+        "bots": {
+            "type": "object",
+            "patternProperties": {
+                "^.*$": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "description": "server assigned unique identifier for the bot",
+                            "type": "string"
+                        },
+                        "hostUserId": {
+                            "$ref": "../definitions/userId.json",
+                            "description": "which player will run the bot. It is the same as the player that added the bot."
+                        },
+                        "allyTeam": { "type": "string" },
+                        "team": { "type": "string" },
+                        "player": { "type": "string" },
+                        "name": {
+                            "description": "name to display in the lobby",
+                            "type": "string",
+                            "maxLength": 20
+                        },
+                        "shortName": {
+                            "description": "short name of the bot. Used to uniquely identify which bot to run",
+                            "type": "string",
+                            "maxLength": 20
+                        },
+                        "version": { "type": "string" },
+                        "options": {
+                            "type": "object",
+                            "patternProperties": {
+                                "^.*$": { "type": "string" }
+                            }
+                        }
+                    },
+                    "required": [
+                        "id",
+                        "hostUserId",
+                        "allyTeam",
+                        "team",
+                        "player",
+                        "shortName"
+                    ]
+                }
+            }
+        },
+        "currentBattle": {
+            "description": "If a battle is currently happening, here are the info",
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "startedAt": { "$ref": "../definitions/unixTime.json" }
+            },
+            "required": ["id", "startedAt"]
+        },
+        "currentVote": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "action": { "$ref": "../definitions/voteActions.json" },
+                "initiator": { "$ref": "../definitions/userId.json" },
+                "voters": {
+                    "description": "indexed by the userId. The initiator is also included in this object",
+                    "type": "object",
+                    "patternProperties": {
+                        "^.*$": {
+                            "type": "object",
+                            "properties": {
+                                "vote": {
+                                    "enum": ["pending", "yes", "no", "abstain"]
+                                }
+                            },
+                            "required": ["vote"]
+                        }
+                    }
+                },
+                "until": { "$ref": "../definitions/unixTime.json" }
+            },
+            "required": ["id", "action", "initiator", "voters", "until"]
+        },
+        "voteHistory": {
+            "type": "object",
+            "patternProperties": {
+                "^.*$": {
+                    "type": "object",
+                    "properties": {
+                        "vote": { "$ref": "../definitions/voteActions.json" },
+                        "outcome": {
+                            "$ref": "../definitions/voteOutcomes.json"
+                        },
+                        "finishedAt": { "$ref": "../definitions/unixTime.json" }
+                    },
+                    "required": ["vote", "outcome", "finishedAt"]
+                }
+            }
+        }
+    },
+    "required": [
+        "id",
+        "name",
+        "mapName",
+        "engineVersion",
+        "gameVersion",
+        "gameOptions",
+        "allyTeamConfig",
+        "areBossesEnabled",
+        "bosses",
+        "players",
+        "spectators",
+        "bots"
+    ]
+}

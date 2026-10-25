@@ -1,0 +1,1052 @@
+defmodule Teiserver.Tachyon.MatchmakingTest do
+  alias Teiserver.Asset
+  alias Teiserver.AssetFixtures
+  alias Teiserver.Battle
+  alias Teiserver.Game
+  alias Teiserver.Helpers.GeneralTestLib
+  alias Teiserver.Matchmaking.PairingRoom
+  alias Teiserver.Matchmaking.QueueServer
+  alias Teiserver.Matchmaking.QueueSupervisor
+  alias Teiserver.OAuthFixtures
+  alias Teiserver.Player
+  alias Teiserver.Player.SessionRegistry
+  alias Teiserver.Support.Polling
+  alias Teiserver.Support.Tachyon
+  alias Teiserver.TachyonBattle
+  use TeiserverWeb.ConnCase
+
+  defp altair_attr(id),
+    do: %{
+      spring_name: "Altair Crossing Remake " <> id,
+      display_name: "Altair Crossing",
+      thumbnail_url: "https://www.beyondallreason.info/map/altair-crossing",
+      matchmaking_queues: [id]
+    }
+
+  defp rosetta_attr(id),
+    do: %{
+      spring_name: "Rosetta " <> id,
+      display_name: "Rosetta",
+      thumbnail_url: "https://www.beyondallreason.info/map/rosetta",
+      matchmaking_queues: [id]
+    }
+
+  defp map_attrs(id),
+    do: [altair_attr(id), rosetta_attr(id)]
+
+  defp map_names(id) do
+    map_attrs(id)
+    |> Enum.map(fn map -> %{"springName" => map.spring_name} end)
+  end
+
+  defp engine_versions,
+    do: [%{version: "105.1.1-2590-gb9462a0 bar"}, %{version: "100.2.1-2143-test bar"}]
+
+  defp game_versions,
+    do: [
+      %{spring_game: "Beyond All Reason test-26929-d709d32"},
+      %{spring_game: "BAR test version"}
+    ]
+
+  defp engine_names do
+    engine_versions()
+    |> Enum.map(fn engine -> %{"version" => engine.version} end)
+  end
+
+  defp game_names do
+    game_versions()
+    |> Enum.map(fn game -> %{"springName" => game.spring_game} end)
+  end
+
+  defp setup_queue(context) when is_map(context) do
+    setup_queue(1)
+  end
+
+  defp setup_queue(team_size) when is_integer(team_size) do
+    id = UUID.uuid4()
+
+    setup_maps(id)
+    setup_queue(id, team_size)
+  end
+
+  defp setup_queue(id, team_size) do
+    queue_attrs(id, team_size)
+    |> mk_queue()
+  end
+
+  defp setup_maps(id) do
+    map_attrs(id)
+    |> Enum.map(&add_startboxes(&1, 2))
+    |> Enum.each(&AssetFixtures.create_map/1)
+  end
+
+  defp queue_attrs(id, team_size) do
+    maps =
+      Asset.get_maps_for_queue(id)
+
+    %{
+      id: id,
+      name: id,
+      team_size: team_size,
+      team_count: 2,
+      settings: %{tick_interval_ms: :manual, max_distance: 15},
+      engines: engine_versions(),
+      games: game_versions(),
+      maps: maps
+    }
+  end
+
+  defp add_startboxes(attrs, n_teams) do
+    boxes = [
+      %{
+        "maxPlayersPerStartbox" => 8,
+        "startboxes" =>
+          for(
+            _i <- 1..n_teams,
+            into: [],
+            do: %{"poly" => [%{"x" => 0, "y" => 0}, %{"x" => 200, "y" => 200}]}
+          )
+      }
+    ]
+
+    Map.put(attrs, :startboxes_set, boxes)
+  end
+
+  defp mk_queue(attrs) do
+    Polling.poll_until_some(fn -> Process.whereis(QueueSupervisor) end)
+
+    initial_state = QueueServer.init_state(attrs)
+    {:ok, pid} = QueueSupervisor.start_queue!(initial_state)
+
+    {:ok, queue_id: attrs.id, queue_pid: pid, queue_version: initial_state.queue.version}
+  end
+
+  describe "list" do
+    setup [{Tachyon, :setup_client}, :setup_queue]
+
+    test "works", %{client: client, queue_id: q1v1_id, queue_version: version1} do
+      {:ok, queue_id: q2v2_id, queue_pid: _queue_pid, queue_version: version2} = setup_queue(2)
+
+      resp = Tachyon.list_queues!(client)
+
+      # Convert into a set since the order must not impact test result
+      expected_playlists =
+        MapSet.new([
+          %{
+            "id" => q1v1_id,
+            "version" => version1,
+            "name" => q1v1_id,
+            "numOfTeams" => 2,
+            "teamSize" => 1,
+            "ranked" => true,
+            "engines" => engine_names(),
+            "games" => game_names(),
+            "maps" => map_names(q1v1_id)
+          },
+          %{
+            "id" => q2v2_id,
+            "version" => version2,
+            "name" => q2v2_id,
+            "numOfTeams" => 2,
+            "teamSize" => 2,
+            "ranked" => true,
+            "engines" => engine_names(),
+            "games" => game_names(),
+            "maps" => map_names(q2v2_id)
+          }
+        ])
+
+      # Checking for subset because the response also contains default queues
+      assert MapSet.subset?(expected_playlists, MapSet.new(resp["data"]["playlists"]))
+    end
+
+    test "empty map list", %{client: client} do
+      :ok =
+        QueueServer.init_state(%{
+          id: "mapless",
+          name: "mapless",
+          team_size: 1,
+          team_count: 2,
+          engines: engine_versions(),
+          games: game_versions(),
+          maps: []
+        })
+        |> start_queue()
+
+      resp = Tachyon.list_queues!(client)
+      queue = Enum.find(resp["data"]["playlists"], fn x -> x["id"] == "mapless" end)
+
+      expected_queue = %{
+        "id" => "mapless",
+        "name" => "mapless",
+        "numOfTeams" => 2,
+        "teamSize" => 1,
+        "ranked" => true,
+        "engines" => engine_names(),
+        "games" => game_names(),
+        "maps" => []
+      }
+
+      assert expected_queue == Map.drop(queue, ["version"])
+    end
+  end
+
+  describe "joining queues" do
+    setup [{Tachyon, :setup_client}, :setup_queue]
+
+    test "works", %{client: client, queue_id: queue_id, queue_version: version} do
+      resp = Tachyon.join_queues!(client, [%{id: queue_id, version: version}])
+      assert %{"status" => "success"} = resp
+      resp = Tachyon.join_queues!(client, [%{id: queue_id, version: version}])
+      assert %{"status" => "failed", "reason" => "already_queued"} = resp
+    end
+
+    test "multiple", %{client: client, queue_id: queue_id, queue_version: version} do
+      {:ok, queue_id: other_queue_id, queue_pid: _pid, queue_version: other_version} =
+        setup_queue(2)
+
+      resp =
+        Tachyon.join_queues!(client, [
+          %{id: queue_id, version: version},
+          %{id: other_queue_id, version: other_version}
+        ])
+
+      assert %{"status" => "success"} = resp
+    end
+
+    test "all or nothing", %{client: client, queue_id: queue_id, queue_version: version} do
+      resp =
+        Tachyon.join_queues!(client, [
+          %{id: queue_id, version: version},
+          %{id: "lolnope that's not a queue", version: "oops"}
+        ])
+
+      assert %{"status" => "failed", "reason" => "invalid_queue_specified"} = resp
+      resp = Tachyon.join_queues!(client, [%{id: queue_id, version: version}])
+      assert %{"status" => "success"} = resp
+    end
+
+    test "with disconnections", %{
+      token: token,
+      client: client,
+      queue_id: queue_id,
+      queue_version: version
+    } do
+      %{"status" => "success"} = Tachyon.join_queues!(client, [%{id: queue_id, version: version}])
+
+      # clean disconnection removes user from queue
+      Tachyon.disconnect!(client)
+      client = Tachyon.connect(token)
+      %{"status" => "success"} = Tachyon.join_queues!(client, [%{id: queue_id, version: version}])
+
+      # A crash doesn't remove the player from the queue
+      Tachyon.abrupt_disconnect!(client)
+      client = Tachyon.connect(token)
+
+      %{"status" => "failed", "reason" => "already_queued"} =
+        Tachyon.join_queues!(client, [%{id: queue_id, version: version}])
+    end
+
+    test "empty engines", %{client: client} do
+      id = "emptyengines"
+
+      state =
+        QueueServer.init_state(%{
+          id: id,
+          name: id,
+          team_size: 1,
+          team_count: 2,
+          engines: [],
+          games: game_versions(),
+          maps: map_attrs(id)
+        })
+
+      :ok = start_queue(state)
+      version = state.queue.version
+
+      assert %{"status" => "failed", "reason" => "internal_error"} =
+               Tachyon.join_queues!(client, [%{id: id, version: version}])
+    end
+
+    test "empty games", %{client: client} do
+      id = "emptygames"
+
+      state =
+        QueueServer.init_state(%{
+          id: id,
+          name: id,
+          team_size: 1,
+          team_count: 2,
+          engines: engine_versions(),
+          games: [],
+          maps: map_attrs(id)
+        })
+
+      version = state.queue.version
+
+      :ok = start_queue(state)
+
+      assert %{"status" => "failed", "reason" => "internal_error"} =
+               Tachyon.join_queues!(client, [%{id: id, version: version}])
+    end
+
+    test "empty maps", %{client: client} do
+      id = "emptymaps"
+
+      state =
+        QueueServer.init_state(%{
+          id: id,
+          name: id,
+          team_size: 1,
+          team_count: 2,
+          engines: engine_versions(),
+          games: game_versions(),
+          maps: []
+        })
+
+      version = state.queue.version
+
+      :ok = start_queue(state)
+
+      assert %{"status" => "failed", "reason" => "internal_error"} =
+               Tachyon.join_queues!(client, [%{id: id, version: version}])
+    end
+
+    test "cancelled event when queue dies", %{
+      client: client,
+      queue_id: queue_id,
+      queue_pid: queue_pid,
+      queue_version: version
+    } do
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(client, [%{id: queue_id, version: version}])
+
+      Process.unlink(queue_pid)
+      Process.exit(queue_pid, :kill)
+      assert %{"commandId" => "matchmaking/cancelled"} = Tachyon.recv_message!(client)
+
+      # can join again
+      {:ok, queue_id: q2_id, queue_pid: _q2_pid, queue_version: version} = setup_queue(1)
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(client, [%{id: q2_id, version: version}])
+    end
+  end
+
+  describe "interactions with assets" do
+    setup [{Tachyon, :setup_client}, :setup_queue]
+
+    test "cancelled event when engine version change", ctx do
+      Process.unlink(ctx.queue_pid)
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(ctx.client, [%{id: ctx.queue_id, version: ctx.queue_version}])
+
+      g2 = AssetFixtures.create_engine(%{name: "game1"})
+      Asset.set_engine_matchmaking(g2.id)
+      # when running many tests, or with --repeat-until-failure sometimes the
+      # supervisors get restarted too many times without the sleep
+      # I have no idea why a small sleep fixes it though :(
+      :timer.sleep(5)
+      assert %{"commandId" => "matchmaking/cancelled"} = Tachyon.recv_message!(ctx.client)
+    end
+
+    test "cancelled event when game version change", ctx do
+      Process.unlink(ctx.queue_pid)
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(ctx.client, [%{id: ctx.queue_id, version: ctx.queue_version}])
+
+      g2 = AssetFixtures.create_game(%{name: "game1"})
+      Asset.set_game_matchmaking(g2.id)
+      assert %{"commandId" => "matchmaking/cancelled"} = Tachyon.recv_message!(ctx.client)
+    end
+  end
+
+  describe "leaving queues" do
+    setup [{Tachyon, :setup_client}, :setup_queue]
+
+    test "works", %{client: client, queue_id: queue_id, queue_version: version} do
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(client, [%{id: queue_id, version: version}])
+
+      assert %{"status" => "success"} = Tachyon.leave_queues!(client)
+
+      assert %{"commandId" => "matchmaking/cancelled", "data" => %{"reason" => "intentional"}} =
+               Tachyon.recv_message!(client)
+
+      assert %{"status" => "failed", "reason" => "not_queued"} =
+               Tachyon.leave_queues!(client)
+    end
+
+    test "session timeout", %{
+      client: client,
+      queue_id: queue_id,
+      queue_version: version,
+      user: user,
+      token: token
+    } do
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(client, [%{id: queue_id, version: version}])
+
+      Tachyon.abrupt_disconnect!(client)
+
+      # also forcefully terminate the session, this simulates a player
+      # crash without reconnection
+      session_pid = SessionRegistry.lookup(user.id)
+      assert is_pid(session_pid)
+      ref = Player.monitor_session(user.id)
+      Process.exit(session_pid, :kill)
+
+      assert_receive({:DOWN, ^ref, :process, _, _})
+
+      # should have left the queue, so be able to rejoin
+      client = Tachyon.connect(token)
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(client, [%{id: queue_id, version: version}])
+    end
+  end
+
+  describe "pairing" do
+    defp setup_app(_context) do
+      owner = GeneralTestLib.make_user(%{"roles" => ["Verified"]})
+
+      app =
+        OAuthFixtures.app_attrs(owner.id)
+        |> Map.put(:uid, UUID.uuid4())
+        |> OAuthFixtures.create_app()
+
+      {:ok, app: app}
+    end
+
+    defp setup_user(app) do
+      user = GeneralTestLib.make_user(%{"roles" => ["Verified"]})
+      token = OAuthFixtures.token_attrs(user, app) |> OAuthFixtures.create_token()
+      client = Tachyon.connect(token)
+      {:ok, %{user: user, token: token, client: client}}
+    end
+
+    setup [:setup_queue, :setup_app]
+
+    test "get found events", %{
+      queue_id: queue_id,
+      app: app,
+      queue_pid: queue_pid,
+      queue_version: version
+    } do
+      {:ok, %{user: _user1, client: client1}} = setup_user(app)
+      {:ok, %{user: _user2, client: client2}} = setup_user(app)
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(client1, [%{id: queue_id, version: version}])
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(client2, [%{id: queue_id, version: version}])
+
+      send(queue_pid, :tick)
+      :timer.sleep(50)
+
+      Enum.each([client1, client2], fn client ->
+        assert {:ok, resp} = Tachyon.recv_message(client, timeout: 10)
+
+        assert %{
+                 "commandId" => "matchmaking/found",
+                 "data" => %{
+                   "queueId" => ^queue_id
+                 }
+               } = resp
+      end)
+
+      # check that players aren't matched multiple times
+      send(queue_pid, :tick)
+      assert {:error, :timeout} = Tachyon.recv_message(client1, timeout: 10)
+    end
+
+    test "handle ready events", %{
+      queue_id: queue_id,
+      app: app,
+      queue_pid: queue_pid,
+      queue_version: version
+    } do
+      {:ok, %{client: client1}} = setup_user(app)
+      {:ok, %{client: client2}} = setup_user(app)
+      assert %{"status" => "failed", "reason" => "no_match"} = Tachyon.matchmaking_ready!(client1)
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(client1, [%{id: queue_id, version: version}])
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(client2, [%{id: queue_id, version: version}])
+
+      assert %{"status" => "failed", "reason" => "no_match"} = Tachyon.matchmaking_ready!(client1)
+
+      send(queue_pid, :tick)
+
+      assert {:ok, %{"commandId" => "matchmaking/found"}} = Tachyon.recv_message(client1)
+      assert {:ok, %{"commandId" => "matchmaking/found"}} = Tachyon.recv_message(client2)
+
+      assert %{"status" => "success"} = Tachyon.matchmaking_ready!(client1)
+    end
+
+    test "still considered in queue during pairing", %{
+      queue_id: queue_id,
+      app: app,
+      queue_pid: queue_pid,
+      queue_version: version
+    } do
+      [%{client: client}, _other] =
+        join_and_pair(app, %{id: queue_id, version: version}, queue_pid, 2)
+
+      resp = Tachyon.join_queues!(client, [%{id: queue_id, version: version}])
+      assert %{"status" => "failed", "reason" => "already_queued"} = resp
+    end
+
+    test "cancelled event if queue dies during pairing", ctx do
+      [%{client: client1}, %{client: client2}] =
+        join_and_pair(ctx.app, %{id: ctx.queue_id, version: ctx.queue_version}, ctx.queue_pid, 2)
+
+      Process.unlink(ctx.queue_pid)
+      Process.exit(ctx.queue_pid, :kill)
+
+      assert %{"commandId" => "matchmaking/cancelled"} = Tachyon.recv_message!(client1)
+      assert %{"commandId" => "matchmaking/cancelled"} = Tachyon.recv_message!(client2)
+    end
+
+    test "ready then leave triggers lost events", %{
+      queue_id: queue_id,
+      app: app,
+      queue_pid: queue_pid,
+      queue_version: version
+    } do
+      [%{client: client1}, %{client: client2}] =
+        join_and_pair(app, %{id: queue_id, version: version}, queue_pid, 2)
+
+      assert %{"status" => "success"} = Tachyon.matchmaking_ready!(client1)
+      assert %{"commandId" => "matchmaking/foundUpdate"} = Tachyon.recv_message!(client1)
+      assert %{"commandId" => "matchmaking/foundUpdate"} = Tachyon.recv_message!(client2)
+      assert %{"status" => "success"} = Tachyon.leave_queues!(client1)
+      assert %{"commandId" => "matchmaking/lost"} = Tachyon.recv_message!(client2)
+    end
+
+    test "back in queue if a player decline", %{
+      queue_id: queue_id,
+      app: app,
+      queue_pid: queue_pid,
+      queue_version: version
+    } do
+      [%{client: client1}, %{client: client2}] =
+        join_and_pair(app, %{id: queue_id, version: version}, queue_pid, 2)
+
+      assert %{"status" => "success"} = Tachyon.leave_queues!(client1)
+
+      assert %{"commandId" => "matchmaking/lost"} = Tachyon.recv_message!(client2)
+
+      assert %{"commandId" => "matchmaking/cancelled", "data" => %{"reason" => "intentional"}} =
+               Tachyon.recv_message!(client1)
+
+      assert %{"status" => "failed", "reason" => "already_queued"} =
+               Tachyon.join_queues!(client2, [%{id: queue_id, version: version}])
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(client1, [%{id: queue_id, version: version}])
+
+      # another tick should match them again
+      send(queue_pid, :tick)
+
+      assert {:ok, %{"commandId" => "matchmaking/found"}} = Tachyon.recv_message(client1)
+      assert {:ok, %{"commandId" => "matchmaking/found"}} = Tachyon.recv_message(client2)
+    end
+
+    test "two pairings on different queues", %{app: app} do
+      {:ok, queue_id: q1v1_id, queue_pid: q1v1_pid, queue_version: version1v1} = setup_queue(1)
+      {:ok, queue_id: q2v2_id, queue_pid: q2v2_pid, queue_version: version2v2} = setup_queue(2)
+
+      clients = setup_clients(app, 5)
+
+      [c1, c2, c3, c4, c5] = clients
+
+      for client <- Enum.take(clients, 3) do
+        assert %{"status" => "success"} =
+                 Tachyon.join_queues!(client, [%{id: q2v2_id, version: version2v2}])
+      end
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(c4, [%{id: q1v1_id, version: version1v1}])
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(c5, [
+                 %{id: q1v1_id, version: version1v1},
+                 %{id: q2v2_id, version: version2v2}
+               ])
+
+      send(q2v2_pid, :tick)
+
+      for client <- [c1, c2, c3, c5] do
+        assert {:ok, %{"commandId" => "matchmaking/found"}} = Tachyon.recv_message(client)
+      end
+
+      # getting paired should withdraw the player from a queue so that it doesn't
+      # get 2 `found` events
+      send(q1v1_pid, :tick)
+
+      # a `found` event should be followed by a `lost` event, but it's not
+      # 100% that the `found` event is sent at all
+      case Tachyon.recv_message(c4, timeout: 5) do
+        {:error, :timeout} ->
+          nil
+
+        {:ok, %{"commandId" => "matchmaking/found"}} ->
+          assert {:ok, %{"commandId" => "matchmaking/lost"}} =
+                   Tachyon.recv_message(c4, timeout: 5)
+      end
+
+      assert({:error, :timeout} = Tachyon.recv_message(c5, timeout: 3))
+    end
+
+    test "foundUpdate event", %{app: app} do
+      {:ok, queue_id: q_id, queue_pid: q_pid, queue_version: version} = setup_queue(2)
+
+      clients = setup_clients(app, 4)
+
+      for client <- clients do
+        assert %{"status" => "success"} =
+                 Tachyon.join_queues!(client, [%{id: q_id, version: version}])
+      end
+
+      send(q_pid, :tick)
+
+      for client <- clients do
+        assert {:ok, %{"commandId" => "matchmaking/found"}} = Tachyon.recv_message(client)
+      end
+
+      Enum.with_index(clients, 1)
+      |> Enum.each(fn {client, current} ->
+        Tachyon.matchmaking_ready!(client)
+
+        Enum.each(clients, fn client -> assert_ready_update(client, current) end)
+      end)
+    end
+
+    test "timeout puts ready players back in queue", %{app: app} do
+      uuid = UUID.uuid4()
+
+      setup_maps(uuid)
+
+      {:ok, queue_id: q_id, queue_pid: q_pid, queue_version: version} =
+        queue_attrs(uuid, 1)
+        |> mk_queue()
+
+      clients = setup_clients(app, 2)
+
+      for client <- clients do
+        assert %{"status" => "success"} =
+                 Tachyon.join_queues!(client, [%{id: q_id, version: version}])
+      end
+
+      send(q_pid, :tick)
+
+      for client <- clients do
+        assert {:ok, %{"commandId" => "matchmaking/found"}} = Tachyon.recv_message(client)
+      end
+
+      # this isn't great, but it's better than relying on waiting for some ms. Because
+      # waiting is flaky as it depends on the scheduler and the speed of
+      # the cpu.
+      pairing_room_pid =
+        DynamicSupervisor.which_children(Teiserver.Matchmaking.QueueSupervisor)
+        |> Enum.find(fn {_id, _pid, _type, m} ->
+          m == [PairingRoom]
+        end)
+        |> elem(1)
+
+      assert is_pid(pairing_room_pid)
+
+      [c1, c2] = clients
+      Tachyon.matchmaking_ready!(c1)
+      assert %{"commandId" => "matchmaking/foundUpdate"} = Tachyon.recv_message!(c1)
+      assert %{"commandId" => "matchmaking/foundUpdate"} = Tachyon.recv_message!(c2)
+
+      PairingRoom.timeout(pairing_room_pid)
+
+      # c1 should get lost event and still be in the queue
+      # c2 should get lost event but not be in the queue anymore
+      assert %{"commandId" => "matchmaking/lost"} =
+               Tachyon.recv_message!(c1)
+
+      assert %{"commandId" => "matchmaking/lost"} =
+               Tachyon.recv_message!(c2)
+
+      assert %{"commandId" => "matchmaking/cancelled", "data" => %{"reason" => "ready_timeout"}} =
+               Tachyon.recv_message!(c2)
+
+      assert %{"reason" => "already_queued"} =
+               Tachyon.join_queues!(c1, [%{id: q_id, version: version}])
+
+      assert %{"status" => "success"} = Tachyon.join_queues!(c2, [%{id: q_id, version: version}])
+    end
+
+    test "no autohost", %{
+      app: app,
+      queue_id: queue_id,
+      queue_pid: queue_pid,
+      queue_version: version
+    } do
+      clients = join_and_pair(app, %{id: queue_id, version: version}, queue_pid, 2)
+
+      # slurp all the received messages, each client get a foundUpdate event for
+      # every ready sent
+      for %{client: client} <- clients do
+        assert %{"status" => "success"} = Tachyon.matchmaking_ready!(client)
+
+        for %{client: c} <- clients do
+          assert %{"commandId" => "matchmaking/foundUpdate"} = Tachyon.recv_message!(c)
+        end
+      end
+
+      for %{client: client} <- clients do
+        assert %{"commandId" => "matchmaking/lost"} = Tachyon.recv_message!(client)
+
+        assert %{
+                 "commandId" => "matchmaking/cancelled",
+                 "data" => %{"reason" => "server_error", "details" => "no_host_available"}
+               } =
+                 Tachyon.recv_message!(client)
+      end
+    end
+  end
+
+  describe "state after reconnection" do
+    setup [:setup_queue, :setup_app]
+
+    defp reconnect_self_matchmaking(token) do
+      client = Tachyon.connect(token, swallow_first_event: false)
+
+      %{"commandId" => "user/self", "data" => %{"user" => user}} =
+        Tachyon.recv_message!(client)
+
+      user["matchmaking"]
+    end
+
+    test "no matchmaking", %{app: app} do
+      {:ok, %{client: client, token: token}} = setup_user(app)
+      Tachyon.abrupt_disconnect!(client)
+
+      assert %{"state" => "no_matchmaking"} = reconnect_self_matchmaking(token)
+    end
+
+    test "queuing", %{app: app, queue_id: queue_id, queue_version: version} do
+      {:ok, %{client: client, token: token}} = setup_user(app)
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(client, [%{id: queue_id, version: version}])
+
+      Tachyon.abrupt_disconnect!(client)
+
+      assert %{"state" => "queuing", "queues" => [%{"id" => ^queue_id, "version" => ^version}]} =
+               reconnect_self_matchmaking(token)
+    end
+
+    test "found", %{app: app, queue_id: queue_id, queue_pid: queue_pid, queue_version: version} do
+      [%{client: client, token: token} | _others] =
+        join_and_pair(app, %{id: queue_id, version: version}, queue_pid, 2)
+
+      Tachyon.abrupt_disconnect!(client)
+
+      assert %{
+               "state" => "found",
+               "queue" => %{
+                 "id" => ^queue_id,
+                 "version" => ^version,
+                 "hasAlreadyReadied" => false,
+                 "timeoutAt" => timeout_at
+               },
+               "otherQueues" => []
+             } = reconnect_self_matchmaking(token)
+
+      assert timeout_at > DateTime.utc_now() |> DateTime.to_unix(:microsecond)
+    end
+
+    test "found reports the queues left behind", %{
+      app: app,
+      queue_id: queue_id,
+      queue_pid: queue_pid,
+      queue_version: version
+    } do
+      {:ok, other} = setup_queue(1)
+      other_id = other[:queue_id]
+      other_version = other[:queue_version]
+
+      {:ok, %{client: client, token: token}} = setup_user(app)
+      {:ok, %{client: other_client}} = setup_user(app)
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(client, [
+                 %{id: queue_id, version: version},
+                 %{id: other_id, version: other_version}
+               ])
+
+      assert %{"status" => "success"} =
+               Tachyon.join_queues!(other_client, [%{id: queue_id, version: version}])
+
+      send(queue_pid, :tick)
+      assert {:ok, %{"commandId" => "matchmaking/found"}} = Tachyon.recv_message(client)
+
+      Tachyon.abrupt_disconnect!(client)
+
+      assert %{
+               "state" => "found",
+               "queue" => %{"id" => ^queue_id},
+               "otherQueues" => [%{"id" => ^other_id, "version" => ^other_version}]
+             } = reconnect_self_matchmaking(token)
+    end
+
+    test "found after readying up", %{
+      app: app,
+      queue_id: queue_id,
+      queue_pid: queue_pid,
+      queue_version: version
+    } do
+      [%{client: client, token: token} | _others] =
+        join_and_pair(app, %{id: queue_id, version: version}, queue_pid, 2)
+
+      assert %{"status" => "success"} = Tachyon.matchmaking_ready!(client)
+      Tachyon.abrupt_disconnect!(client)
+
+      assert %{"state" => "found", "queue" => %{"hasAlreadyReadied" => true}} =
+               reconnect_self_matchmaking(token)
+    end
+  end
+
+  describe "join with autohost" do
+    setup [{Tachyon, :setup_client}, :setup_app, :setup_queue, {Tachyon, :setup_autohost}]
+
+    test "happy full path", %{
+      app: app,
+      queue_id: queue_id,
+      queue_pid: queue_pid,
+      queue_version: version,
+      autohost_client: autohost_client
+    } do
+      [usr1, usr2] = clients = join_and_pair(app, %{id: queue_id, version: version}, queue_pid, 2)
+
+      %{"status" => "success"} = Tachyon.subscribe_updates!(usr1.client, [usr2.user.id])
+      %{"status" => "success"} = Tachyon.subscribe_updates!(usr2.client, [usr1.user.id])
+      %{"commandId" => "user/updated"} = Tachyon.recv_message!(usr1.client)
+      %{"commandId" => "user/updated"} = Tachyon.recv_message!(usr2.client)
+
+      all_ready_up!(clients)
+
+      start_req = Tachyon.recv_message!(autohost_client)
+      assert %{"commandId" => "autohost/start", "type" => "request", "data" => data} = start_req
+      battle_id = data["battleId"]
+
+      host_data = %{
+        ips: ["127.0.0.1"],
+        port: 48912
+      }
+
+      Tachyon.send_response(autohost_client, start_req, data: host_data)
+
+      user_ids =
+        for ally_team <- data["allyTeams"],
+            team <- ally_team["teams"],
+            player <- team["players"] do
+          assert Map.has_key?(player, "name")
+          assert Map.has_key?(player, "password")
+          player["userId"]
+        end
+
+      assert Enum.count(user_ids) == 2
+
+      for user_id <- user_ids do
+        {user_id, _remainder} = Integer.parse(user_id)
+        assert is_pid(SessionRegistry.lookup(user_id))
+      end
+
+      # Map will be randomly selected so we first check if the
+      # first client's map is in the map pool
+      first_message = Tachyon.recv_message!(usr1.client)
+
+      assert %{
+               "commandId" => "battle/start",
+               "data" => %{
+                 "battleId" => _id,
+                 "ips" => [_ip],
+                 "port" => _port,
+                 "engine" => %{"version" => "105.1.1-2590-gb9462a0 bar"},
+                 "game" => %{"springName" => "Beyond All Reason test-26929-d709d32"},
+                 "map" => %{"springName" => spring_name}
+               }
+             } = first_message
+
+      maps =
+        map_attrs(queue_id)
+        |> Enum.map(fn map -> map.spring_name end)
+
+      assert spring_name in maps
+
+      # and then that the other client has the same map
+      assert %{
+               "commandId" => "battle/start",
+               "data" => %{
+                 "battleId" => _id,
+                 "ips" => [_ip],
+                 "port" => _port,
+                 "engine" => %{"version" => "105.1.1-2590-gb9462a0 bar"},
+                 "game" => %{"springName" => "Beyond All Reason test-26929-d709d32"},
+                 "map" => %{"springName" => ^spring_name}
+               }
+             } = Tachyon.recv_message!(usr2.client)
+
+      for usr <- clients do
+        %{"commandId" => "user/updated", "data" => %{"users" => [usr_update]}} =
+          Tachyon.recv_message!(usr.client)
+
+        assert usr_update["status"] == "playing"
+      end
+
+      for usr <- clients do
+        %{"status" => "success", "data" => info} = Tachyon.user_info!(usr.client, usr.user.id)
+        assert info["status"] == "playing"
+      end
+
+      match_id = TachyonBattle.get_match_id(battle_id)
+      match = Battle.get_match!(match_id)
+      memberships = Battle.get_match_memberships(match_id)
+
+      assert match.map == spring_name
+      assert match.game_version in (game_versions() |> Enum.map(fn game -> game.spring_game end))
+
+      assert match.engine_version in (engine_versions()
+                                      |> Enum.map(fn engine -> engine.version end))
+
+      assert match.started
+      refute match.finished
+      assert match.game_type == "Duel"
+      assert length(memberships) == 2
+
+      for member <- memberships do
+        assert member.user_id in (user_ids |> Enum.map(fn id -> String.to_integer(id) end))
+        assert member.team_id in [0, 1]
+        refute member.win
+      end
+
+      winning_team_id = 0
+
+      for user_id <- user_ids do
+        Tachyon.autohost_send_update_event(
+          autohost_client,
+          Tachyon.autohost_finished(battle_id, user_id, [winning_team_id])
+        )
+      end
+
+      assert Polling.poll_until_some(fn -> Battle.get_match!(match_id).finished end)
+      memberships = Battle.get_match_memberships(match_id)
+
+      for member <- memberships do
+        if member.team_id == winning_team_id do
+          assert member.win
+        else
+          refute member.win
+        end
+      end
+
+      Tachyon.autohost_send_update_event(autohost_client, Tachyon.autohost_engine_quit(battle_id))
+
+      assert Polling.poll_until_true(fn ->
+               Game.count_rating_logs(search: [match_id: match_id]) == 2
+             end)
+
+      for usr <- clients do
+        %{"commandId" => "user/updated", "data" => %{"users" => [%{"status" => "menu"}]}} =
+          Tachyon.recv_message!(usr.client)
+      end
+    end
+
+    test "autohost errors propagates to clients",
+         %{
+           app: app,
+           queue_id: queue_id,
+           queue_pid: queue_pid,
+           queue_version: version,
+           autohost_client: autohost_client
+         } do
+      clients =
+        join_and_pair(app, %{id: queue_id, version: version}, queue_pid, 2)
+        |> all_ready_up!()
+
+      start_req = Tachyon.recv_message!(autohost_client)
+      assert %{"commandId" => "autohost/start", "type" => "request", "data" => _data} = start_req
+
+      resp_data = [reason: "engine_version_not_available"]
+      assert :ok = Tachyon.send_response(autohost_client, start_req, resp_data)
+
+      for %{client: client} <- clients do
+        assert %{"commandId" => "matchmaking/lost"} = Tachyon.recv_message!(client)
+
+        assert %{
+                 "commandId" => "matchmaking/cancelled",
+                 "data" => %{
+                   "reason" => "server_error",
+                   "details" => "engine_version_not_available"
+                 }
+               } =
+                 Tachyon.recv_message!(client)
+      end
+    end
+  end
+
+  defp setup_clients(app, amount) do
+    Enum.map(1..amount, fn _i ->
+      {:ok, %{client: client}} = setup_user(app)
+      client
+    end)
+  end
+
+  defp join_and_pair(app, queue, queue_pid, number_of_player) do
+    data =
+      Enum.map(1..number_of_player, fn _i ->
+        {:ok, %{client: client} = data} = setup_user(app)
+        assert %{"status" => "success"} = Tachyon.join_queues!(client, [queue])
+        data
+      end)
+
+    send(queue_pid, :tick)
+
+    Enum.each(data, fn %{client: client} ->
+      assert {:ok, %{"commandId" => "matchmaking/found"}} = Tachyon.recv_message(client)
+    end)
+
+    data
+  end
+
+  defp all_ready_up!(clients) do
+    # slurp all the received messages, each client get a foundUpdate event for
+    # every ready sent
+    for %{client: client} <- clients do
+      assert %{"status" => "success"} = Tachyon.matchmaking_ready!(client)
+
+      for %{client: c} <- clients do
+        assert %{"commandId" => "matchmaking/foundUpdate"} = Tachyon.recv_message!(c)
+      end
+    end
+
+    clients
+  end
+
+  defp assert_ready_update(client, current) do
+    assert {:ok,
+            %{
+              "commandId" => "matchmaking/foundUpdate",
+              "data" => %{
+                "readyCount" => ^current
+              }
+            }} = Tachyon.recv_message(client, timeout: 10)
+  end
+
+  defp start_queue(state) do
+    {:ok, _pid} = QueueSupervisor.start_queue!(state)
+    :ok
+  end
+end

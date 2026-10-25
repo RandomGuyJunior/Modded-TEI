@@ -1,0 +1,61 @@
+<% bsname = view_colour() %>
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <TeiserverWeb.Components.Admin.BadgeTypeComponents.section_menu
+          active="index"
+          colour={bsname}
+        />
+        <br /><br />
+
+        <h4>Listing Badge Types</h4>
+
+        <div class="table-responsive">
+          <table class="table table-sm">
+            <thead>
+              <tr>
+                <th colspan="2">Name</th>
+                <th>Purposes</th>
+                <th>Restriction</th>
+
+                <th colspan="2">&nbsp;</th>
+              </tr>
+            </thead>
+            <tbody>
+              <%= for badge_type <- @badge_types do %>
+                <tr>
+                  <td style={"background-color: #{badge_type.colour}; color: #FFF;"} width="22">
+                    <Fontawesome.icon icon={badge_type.icon} style="regular" />
+                  </td>
+                  <td>{badge_type.name}</td>
+                  <td>{badge_type.purpose}</td>
+                  <td>{badge_type.restriction}</td>
+
+                  <td>
+                    <a
+                      href={~p"/teiserver/admin/badge_types/#{badge_type.id}"}
+                      class="btn btn-secondary btn-sm"
+                    >
+                      Show
+                    </a>
+                  </td>
+
+                  <td>
+                    <a
+                      href={~p"/teiserver/admin/badge_types/#{badge_type.id}/edit"}
+                      class="btn btn-secondary btn-sm"
+                    >
+                      Edit
+                    </a>
+                  </td>
+                </tr>
+              <% end %>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

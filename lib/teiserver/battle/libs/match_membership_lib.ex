@@ -1,0 +1,59 @@
+defmodule Teiserver.Battle.MatchMembershipLib do
+  @moduledoc false
+  alias Teiserver.Battle.MatchMembership
+
+  use TeiserverWeb, :library
+
+  def colours, do: :primary2
+  def icon, do: "fa-solid fa-users"
+
+  @spec get_match_memberships() :: Ecto.Query.t()
+  def get_match_memberships do
+    from(match_memberships in MatchMembership)
+  end
+
+  @spec search(Ecto.Query.t(), map | nil) :: Ecto.Query.t()
+  def search(query, nil), do: query
+
+  def search(query, params) do
+    params
+    |> Enum.reduce(query, fn {key, value}, query_acc ->
+      _search(query_acc, key, value)
+    end)
+  end
+
+  def _search(query, _key, ""), do: query
+  def _search(query, _key, nil), do: query
+
+  def _search(query, :user_id, user_id) do
+    from match_memberships in query,
+      where: match_memberships.user_id == ^user_id
+  end
+
+  def _search(query, :user_id_in, user_ids) do
+    from match_memberships in query,
+      where: match_memberships.user_id in ^user_ids
+  end
+
+  def _search(query, :user_id_not_in, user_ids) do
+    from match_memberships in query,
+      where: match_memberships.user_id not in ^user_ids
+  end
+
+  def _search(query, :match_id, match_id) do
+    from match_memberships in query,
+      where: match_memberships.match_id == ^match_id
+  end
+
+  def _search(query, :team_id, team_id) do
+    from match_memberships in query,
+      where: match_memberships.team_id == ^team_id
+  end
+
+  @spec preload(Ecto.Query.t(), list | nil) :: Ecto.Query.t()
+  def preload(query, nil), do: query
+
+  def preload(query, _preloads) do
+    query
+  end
+end

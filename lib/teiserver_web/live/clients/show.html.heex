@@ -1,0 +1,83 @@
+<% bsname = @view_colour %>
+
+<div class="row">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname} page-card"}>
+      <div class="card-body">
+        <div class="float-end">
+          <a href={~p"/teiserver/admin/user/#{@user.id}"} class={"btn btn-#{bsname}"}>
+            Show
+          </a>
+
+          <a href={~p"/teiserver/admin/user/#{@user.id}/edit"} class={"btn btn-#{bsname}"}>
+            Edit
+          </a>
+        </div>
+
+        <h3>
+          {@user.name}
+        </h3>
+
+        <ul>
+          <li>Bot: {Teiserver.Account.Auth.is_bot?(@user)}</li>
+          <li>Moderator: {Teiserver.Account.Auth.moderator?(@user)}</li>
+          <li>
+            Battle:
+            <%= if @client != nil and @client.lobby_id != nil do %>
+              <.link navigate={~p"/battle/lobbies/show/#{@client.lobby_id}"}>
+                Battle #{@client.lobby_id}
+              </.link>
+              <%= if @current_client do %>
+                <span phx-click="join-lobby" class={"btn btn-#{bsname} btn-sm"}>
+                  Join
+                </span>
+              <% end %>
+            <% else %>
+              nil
+            <% end %>
+          </li>
+        </ul>
+
+        <%= if allow?(@current_user, "Server") do %>
+          <div class="row">
+            <div class="col-md-6">
+              <h4>Client</h4>
+              <pre>
+      <%= Kernel.inspect @client, pretty: true, limit: :infinity %>
+    </pre>
+            </div>
+            <div class="col-md-6">
+              <h4>User</h4>
+              <pre>
+      <%= Kernel.inspect @user, pretty: true, limit: :infinity %>
+    </pre>
+            </div>
+          </div>
+        <% end %>
+        <br />
+
+        <div class="float-end">
+          <%= if @client != nil and @client.lobby_client == "LuaLobby Chobby" do %>
+            <span class="btn btn-warning mx-2" phx-click="force-error-log">
+              Error log
+            </span>
+          <% end %>
+
+          <span class="btn btn-danger mx-2" phx-click="force-reconnect">
+            Force reconnect
+          </span>
+
+          <span class="btn btn-danger2 mx-2" phx-click="force-flood">
+            Engage flood protection
+          </span>
+        </div>
+
+        <span>
+          <.link navigate={~p"/teiserver/admin/client"} class="btn btn-secondary">
+            Back
+          </.link>
+        </span>
+      </div>
+    </div>
+  </div>
+</div>

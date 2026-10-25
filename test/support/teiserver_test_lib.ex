@@ -1,0 +1,599 @@
+defmodule Teiserver.TeiserverTestLib do
+  @moduledoc false
+
+  alias ExUnit.Callbacks
+  alias Teiserver.Account
+  alias Teiserver.Account.AccoladeLib
+  alias Teiserver.CacheUser
+  alias Teiserver.Client
+  alias Teiserver.Coordinator
+  alias Teiserver.Coordinator.CoordinatorServer
+  alias Teiserver.Data.Types, as: T
+  alias Teiserver.Game
+  alias Teiserver.Game.MatchRatingLib
+  alias Teiserver.Lobby
+  alias Teiserver.Moderation
+  alias Teiserver.SpringTcpServer
+  alias Teiserver.Telemetry
+  import ExUnit.Assertions
+  import ExUnit.Callbacks
+
+  @host ~c"127.0.0.1"
+
+  @spec raw_setup(map()) :: %{socket: port()}
+  def raw_setup(context), do: do_connect_socket(context, :tcp)
+
+  # Looks like we might want to use https://erlang.org/documentation/doc-12.0/lib/ssl-10.4/doc/html/ssl.html#connect-2
+  # and upgrade the connection instead?
+  @spec spring_tls_setup(map()) :: %{socket: port()}
+  def spring_tls_setup(context), do: do_connect_socket(context, :tls)
+
+  def get_listener_port(transport_type) do
+    SpringTcpServer.get_listener_socket_opts(transport_type)
+    |> Keyword.fetch!(:port)
+  end
+
+  @spec new_user_name :: String.t()
+  def new_user_name do
+    "test_user_#{:rand.uniform(99_999_999) + 1_000_000}"
+  end
+
+  @spec new_user(any, any) :: atom | %{:id => any, optional(any) => any}
+  def new_user(name \\ nil, params \\ %{}) do
+    name = name || new_user_name()
+
+    case CacheUser.deprecated_get_user_by_name(name) do
+      nil ->
+        {:ok, user} =
+          CacheUser.user_register_params_with_md5(
+            name,
+            "#{name}@email.com",
+            Account.spring_md5_password("password"),
+            params
+          )
+          |> Account.create_user()
+
+        Account.update_user_stat(user.id, %{
+          "country" => "??",
+          "lobby_client" => "LuaLobby Chobby"
+        })
+
+        user
+        |> CacheUser.convert_user()
+        |> CacheUser.add_user()
+
+      _existing ->
+        new_user()
+    end
+  end
+
+  @spec async_auth_setup(map() | nil) :: %{user: map(), state: map()}
+  def async_auth_setup(user \\ nil) do
+    user = if user, do: user, else: new_user()
+
+    token = CacheUser.create_token(user)
+
+    case CacheUser.try_login(token, "127.0.0.1", "AsyncTest", "token1 token2") do
+      {:ok, _user} -> :ok
+      value -> raise "Error setting up user - #{Kernel.inspect(value)}"
+    end
+
+    Client.login(user, :test, "127.0.0.1")
+
+    %{user: user, state: mock_async_state(user)}
+  end
+
+  @spec auth_setup(nil | map()) :: %{socket: port(), user: map(), pid: pid()}
+  def auth_setup(context, user \\ nil) do
+    user = if user, do: user, else: new_user()
+
+    %{socket: socket} = raw_setup(context)
+    # Ignore the TASSERVER
+    _reply = _recv_raw(socket)
+
+    # Now do our login
+    # X03MO1qnZdYdgyfeuILPmQ== = Account.spring_md5_password("password")
+    _send_raw(
+      socket,
+      "LOGIN #{user.name} X03MO1qnZdYdgyfeuILPmQ== 0 * LuaLobby Chobby\t1993717506 0d04a635e200f308\tb sp\n"
+    )
+
+    _reply = _recv_until(socket)
+
+    pid =
+      case Client.get_client_by_id(user.id) do
+        nil ->
+          :timer.sleep(250)
+          Client.get_client_by_id(user.id)
+
+        client ->
+          client.tcp_pid
+      end
+
+    # Ensure that the user is cleanly disconnected. Otherwise it t doesn't fails tests,
+    # but you get a ton of errors in the console about connection
+    # pool errors like `Client XXX is still using a connection from owner at location…`
+    # This is because upon disconnecting, the server does a bunch of DB call for logging
+    # and telemetry. The disconnection happen when the tcp socket is closed, and by
+    # that time, the test has ended and the SQL sandbox closed.
+    Callbacks.on_exit(fn -> Client.disconnect(user.id) end)
+    %{socket: socket, user: user, pid: pid}
+  end
+
+  def _send_raw({:sslsocket, _tcp, _tls} = socket, msg) do
+    :ok = :ssl.send(socket, msg)
+    :timer.sleep(10)
+  end
+
+  def _send_raw(socket, msg) do
+    :ok = :gen_tcp.send(socket, msg)
+    :timer.sleep(10)
+  end
+
+  def _recv_lines, do: _recv_lines(1)
+  def _recv_lines(:until_timeout), do: _recv_lines(99_999)
+
+  def _recv_lines(lines) do
+    receive do
+      value ->
+        cond do
+          value == :server_sent_message ->
+            _recv_lines(lines)
+
+          is_tuple(value) ->
+            _recv_lines(lines)
+
+          true ->
+            case lines do
+              1 ->
+                value
+
+              _other ->
+                value <> _recv_lines(lines - 1)
+            end
+        end
+    after
+      500 ->
+        ""
+    end
+  end
+
+  def _recv_raw({:sslsocket, _tcp, _tls} = socket) do
+    case :ssl.recv(socket, 0, 500) do
+      {:ok, reply} -> IO.iodata_to_binary(reply)
+      {:error, :timeout} -> :timeout
+      {:error, :closed} -> :closed
+    end
+  end
+
+  def _recv_raw(socket) do
+    case :gen_tcp.recv(socket, 0, 500) do
+      {:ok, reply} -> IO.iodata_to_binary(reply)
+      {:error, :timeout} -> :timeout
+      {:error, :closed} -> :closed
+    end
+  end
+
+  def _recv_binary(socket) do
+    case :gen_tcp.recv(socket, 0, 500) do
+      {:ok, reply} -> reply
+      {:error, :timeout} -> :timeout
+      {:error, :closed} -> :closed
+    end
+  end
+
+  def _recv_until(socket), do: _recv_until(socket, "")
+
+  def _recv_until({:sslsocket, _tcp, _tls} = socket, acc) do
+    case :ssl.recv(socket, 0, 1000) do
+      {:ok, reply} ->
+        _recv_until(socket, acc <> IO.iodata_to_binary(reply))
+
+      {:error, :timeout} ->
+        acc
+    end
+  end
+
+  def _recv_until(socket, acc) do
+    case :gen_tcp.recv(socket, 0, 1000) do
+      {:ok, reply} ->
+        _recv_until(socket, acc <> IO.iodata_to_binary(reply))
+
+      {:error, :timeout} ->
+        acc
+    end
+  end
+
+  def mock_socket do
+    %{
+      mock: true,
+      transport: Teiserver.FakeTransport
+    }
+  end
+
+  def mock_state_raw do
+    socket = mock_socket()
+
+    %{
+      # Connection state
+      message_part: "",
+      last_msg: System.system_time(:second) - 5,
+      socket: socket,
+      transport: socket.transport,
+      ip: "127.0.0.1",
+
+      # Client state
+      userid: nil,
+      username: nil,
+      lobby_host: false,
+      user: nil,
+      queues: [],
+      ready_queue_id: nil,
+
+      # Connection microstate
+      lobby_id: nil,
+      room_member_cache: %{},
+      known_users: %{},
+      known_battles: [],
+      exempt_from_cmd_throttle: true,
+      script_password: nil,
+      last_message_invalid: false
+    }
+  end
+
+  def mock_state_auth(opts \\ %{}) do
+    socket = mock_socket()
+    user = new_user()
+    Client.login(user, :test, "127.0.0.1")
+
+    %{
+      # Connection state
+      message_part: "",
+      last_msg: System.system_time(:second) - 5,
+      socket: socket,
+      transport: socket.transport,
+      ip: "127.0.0.1",
+
+      # Client state
+      userid: user.id,
+      username: user.name,
+      lobby_host: false,
+      user: user,
+
+      # Connection microstate
+      lobby_id: nil,
+      room_member_cache: %{},
+      known_users: %{},
+      known_battles: [],
+      exempt_from_cmd_throttle: true,
+      script_password: nil,
+      last_message_invalid: false
+    }
+    |> Map.merge(opts)
+  end
+
+  def mock_async_state(user \\ nil) do
+    socket = mock_socket()
+    user = if user, do: user, else: new_user()
+
+    %{
+      # Testing specific
+      mock: true,
+      test_pid: self(),
+
+      # Connection state
+      message_part: "",
+      last_msg: System.system_time(:second) - 5,
+      socket: socket,
+      transport: make_async_transport(),
+      ip: "127.0.0.1",
+
+      # Client state
+      userid: user.id,
+      username: user.name,
+      lobby_host: false,
+      user: user,
+
+      # Connection microstate
+      lobby_id: nil,
+      room_member_cache: %{},
+      known_users: %{},
+      known_battles: [],
+      exempt_from_cmd_throttle: true,
+      script_password: nil,
+      last_message_invalid: false
+    }
+  end
+
+  @spec conn_setup({:ok, list()}) :: {:ok, list()}
+  def conn_setup({:ok, data}) do
+    user = data[:user]
+    CacheUser.deprecated_recache_user(user.id)
+
+    {:ok, data}
+  end
+
+  @spec server_permissions() :: [String.t()]
+  def server_permissions do
+    ["Server"] ++ admin_permissions()
+  end
+
+  @spec admin_permissions() :: [String.t()]
+  def admin_permissions do
+    ["Admin", "Moderator"] ++ staff_permissions()
+  end
+
+  @spec moderator_permissions() :: [String.t()]
+  def moderator_permissions do
+    ["Moderator"] ++ overwatch_permissions()
+  end
+
+  @spec overwatch_permissions() :: [String.t()]
+  def overwatch_permissions do
+    ["Overwatch"]
+  end
+
+  @spec staff_permissions() :: [String.t()]
+  def staff_permissions do
+    ["Contributor"] ++ player_permissions()
+  end
+
+  @spec player_permissions() :: [String.t()]
+  def player_permissions do
+    ["Verified"]
+  end
+
+  @spec make_lobby() :: T.lobby_id()
+  @spec make_lobby(map()) :: T.lobby_id()
+  def make_lobby(params \\ %{}) do
+    host = new_user()
+
+    lobby =
+      %{
+        id: :rand.uniform(999_999_999_999_999),
+        founder_id: host.id,
+        founder_name: host.name,
+        cmd: "c.lobby.create",
+        name: "ServerName",
+        nattype: "none",
+        port: 1234,
+        game_hash: "string_of_characters",
+        map_hash: "string_of_characters",
+        map_name: "koom valley",
+        game_name: "BAR",
+        engine_name: "spring-105",
+        engine_version: "105.1.2.3",
+        settings: %{
+          max_players: 12
+        }
+      }
+      |> Map.merge(params)
+      |> Lobby.create_lobby()
+      |> Lobby.add_lobby()
+
+    lobby.id
+  end
+
+  @spec make_battle(map()) :: map()
+  def make_battle(params \\ %{}) do
+    id = :rand.uniform(99_999_999) + 1_000_000
+
+    %{
+      founder_id: id,
+      founder_name: "TEST_USER_#{id}",
+      name: "BATTLE_#{id}",
+      type: "normal",
+      nattype: :none,
+      port: "",
+      max_players: 4,
+      game_hash: "game_hash",
+      map_hash: "map_hash",
+      password: nil,
+      rank: 0,
+      locked: false,
+      engine_name: "engine_name",
+      engine_version: "engine_version",
+      map_name: "map_name",
+      game_name: "game_name",
+      ip: "127.0.0.1"
+    }
+    |> Map.merge(params)
+    |> Lobby.create_lobby()
+    |> Lobby.add_lobby()
+  end
+
+  def create_moderation_user_report(target_id, reporter_id, params \\ %{}) do
+    Map.merge(
+      %{
+        reporter_id: reporter_id,
+        target_id: target_id,
+        type: "chat",
+        sub_type: "hate",
+        extra_text: "default extra text",
+        match_id: nil
+      },
+      params
+    )
+    |> Moderation.create_report()
+  end
+
+  def teiserver_seed do
+    CoordinatorServer.get_coordinator_account()
+
+    Account.get_or_add_smurf_key_type("client_app_hash")
+    Account.get_or_add_smurf_key_type("chobby_hash")
+    Account.get_or_add_smurf_key_type("hw1")
+    Account.get_or_add_smurf_key_type("hw2")
+    Account.get_or_add_smurf_key_type("hw3")
+    Account.get_or_add_smurf_key_type("hw4")
+    Account.get_or_add_smurf_key_type("ip")
+
+    Enum.each(MatchRatingLib.rating_type_list(), fn rating_type ->
+      Game.get_or_add_rating_type(rating_type)
+    end)
+
+    Telemetry.get_or_add_complex_server_event_type("Server startup")
+    Telemetry.get_or_add_simple_server_event_type("account.user_login")
+    Telemetry.get_or_add_simple_server_event_type("lobby.force_add_user_to_lobby")
+    Telemetry.get_or_add_simple_server_event_type("disconnect")
+    Telemetry.get_or_add_simple_server_event_type("disconnect::tcp_closed with socket")
+    Telemetry.get_or_add_simple_server_event_type("disconnect:tcp_server terminate")
+    Telemetry.get_or_add_complex_client_event_type("client.user_event")
+    Telemetry.get_or_add_complex_client_event_type("client.user_event")
+
+    Telemetry.get_or_add_simple_lobby_event_type("remove_user_from_lobby")
+
+    seed_badge_types()
+  end
+
+  @doc """
+  Traverse most ConCache tables and delete everything from them.
+  Because ETS tables are global, failing to clear the cache between tests may introduce errors
+  since SQL transactions are rolled back, and so the caches hold values that are no longer in the
+  sandboxed DB used in test.
+
+  TODO:
+  Some tables declared in lib/teiserver/application.ex aren't cleared here, it seems they are important
+  for some tests, but this needs further investigation.
+
+  See https://github.com/sasa1977/con_cache?tab=readme-ov-file#testing-in-your-application
+
+  returns :ok
+  """
+  def clear_all_con_caches do
+    cache_list = [
+      :telemetry_complex_client_event_types_cache,
+      :telemetry_complex_lobby_event_types_cache,
+      :telemetry_complex_match_event_types_cache,
+      :telemetry_complex_server_event_types_cache,
+      :telemetry_property_types_cache,
+      :telemetry_simple_client_event_types_cache,
+      :telemetry_simple_lobby_event_types_cache,
+      :telemetry_simple_match_event_types_cache,
+      :telemetry_simple_server_event_types_cache,
+      :teiserver_game_rating_types
+    ]
+
+    Enum.each(cache_list, &clear_cache/1)
+
+    :ok
+  end
+
+  def clear_cache(cache) do
+    cache
+    |> ConCache.ets()
+    |> :ets.tab2list()
+    |> Enum.each(fn {key, _value} -> ConCache.delete(cache, key) end)
+  end
+
+  def start_spring_server(context \\ %{}) do
+    listener_types = Map.get(context, :start_spring_server, :tcp) |> List.wrap()
+
+    listeners =
+      for transport_type <- listener_types do
+        ref = make_ref()
+
+        opts =
+          Application.get_env(:teiserver, Teiserver.SpringTcpServer)[:listeners][transport_type]
+
+        child_spec = Teiserver.Application.spring_server_listener_child(opts, ref, transport_type)
+        assert {:ok, pid} = Supervisor.start_child(Teiserver.Supervisor, child_spec)
+        Supervisor.which_children(Teiserver.Supervisor)
+
+        {transport_type,
+         %{pid: pid, port: :ranch.get_port(ref), ref: ref, id: elem(child_spec, 0)}}
+      end
+
+    on_exit(fn ->
+      Enum.each(listeners, fn {_typ, %{id: id}} ->
+        Supervisor.terminate_child(Teiserver.Supervisor, id)
+      end)
+    end)
+
+    {:ok, %{spring_server: Map.new(listeners)}}
+  end
+
+  def start_coordinator! do
+    assert {:ok, pid} = Coordinator.start_coordinator()
+
+    on_exit(fn ->
+      assert :ok =
+               DynamicSupervisor.terminate_child(Coordinator.DynamicSupervisor, pid)
+    end)
+  end
+
+  defp do_connect_socket(context, :tcp),
+    do: do_connect_socket(context, :tcp, transport: :gen_tcp)
+
+  defp do_connect_socket(context, :tls),
+    do: do_connect_socket(context, :tls, verify: :verify_none, transport: :ssl)
+
+  defp do_connect_socket(context, transport_type, opts) do
+    {transport, opts} = Keyword.pop!(opts, :transport)
+    port = get_in(context, [:spring_server, transport_type, :port])
+
+    assert is_integer(port),
+           """
+           Spring server was not started, must do one of either:
+
+               {:ok, server_context} = Teiserver.TeiserverTestLib.start_spring_server(%{start_spring_server: #{inspect(transport_type)}})
+               setup_function(server_context)
+
+               @import Teiserver.TeiserverTestLib
+               @moduletag start_spring_server: #{inspect(transport_type)}
+               setup start_spring_server
+               text "bla", context do
+                 setup_function(context)
+               end
+
+           Where setup_function is raw_setup or spring_tls_setup
+           """
+
+    socket_opts = Keyword.merge(opts, active: false)
+
+    {:ok, socket} = transport.connect(@host, port, socket_opts)
+
+    %{socket: socket}
+  end
+
+  defp make_async_transport do
+    %{send: fn _x, _y -> nil end}
+  end
+
+  defp seed_badge_types do
+    # Create the badge types
+    if Enum.empty?(AccoladeLib.get_badge_types()) do
+      {:ok, _badge_type1} =
+        Account.create_badge_type(%{
+          name: "Badge A",
+          icon: "i",
+          colour: "c",
+          purpose: "Accolade",
+          description: "Description for the first badge"
+        })
+
+      {:ok, _badge_type2} =
+        Account.create_badge_type(%{
+          name: "Badge B",
+          icon: "i",
+          colour: "c",
+          purpose: "Accolade",
+          description: "Description for the second badge"
+        })
+
+      {:ok, _badge_type3} =
+        Account.create_badge_type(%{
+          name: "Badge C",
+          icon: "i",
+          colour: "c",
+          purpose: "Accolade",
+          description: "Description for the third badge"
+        })
+    end
+  end
+end
+
+defmodule Teiserver.FakeTransport do
+  @moduledoc false
+  def send(_transport, _msg), do: nil
+end

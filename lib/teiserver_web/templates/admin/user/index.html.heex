@@ -1,0 +1,149 @@
+<% bsname = view_colour()
+is_moderator = allow?(@conn, "Moderator") %>
+
+<script type="text/javascript" charset="utf-8">
+  $(function() {
+    <%= if @conn.params["search"] != nil do %>
+      show_search();
+    <% end %>
+  });
+
+  function show_search() {
+    $("#search-box-shower").hide();
+    $("#search-box").show(350);
+  }
+</script>
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <TeiserverWeb.Components.Admin.UserComponents.section_menu
+          active="index"
+          colour={bsname}
+          current_user={@current_user}
+        />
+
+        <%= if @conn.params["search"] != nil do %>
+          {render(TeiserverWeb.Admin.UserView, "search.html", assigns)}
+        <% else %>
+          <%= if assigns[:data_search] != nil do %>
+            {render(TeiserverWeb.Admin.UserView, "data_search.html", assigns)}
+          <% else %>
+            <br /><br />
+          <% end %>
+        <% end %>
+
+        <h4>Listing Users ({Enum.count(@users)})</h4>
+
+        <div class="table-responsive">
+          <table class="table table-sm">
+            <thead>
+              <tr>
+                <th colspan="2">Name</th>
+                <%= if is_moderator do %>
+                  <th>Email</th>
+                <% end %>
+                <th>Client</th>
+                <th>Status</th>
+                <%= if is_moderator do %>
+                  <th>HW</th>
+                  <th>IP</th>
+                <% end %>
+                <th>Roles</th>
+                <th>Registered</th>
+
+                <%= if is_moderator do %>
+                  <th colspan="2">&nbsp;</th>
+                <% else %>
+                  <th>&nbsp;</th>
+                <% end %>
+              </tr>
+            </thead>
+            <tbody>
+              <%= for {user, user_stats} <- @users do %>
+                <tr>
+                  <td style={"background-color: #{user.colour}; color: #FFF;"} width="22">
+                    <Fontawesome.icon icon={user.icon} style="regular" />
+                  </td>
+                  <td>{user.name}</td>
+                  <%= if is_moderator do %>
+                    <td>{user.email}</td>
+                  <% end %>
+                  <td>{user_stats["lobby_client"]}</td>
+
+                  <td>
+                    <TeiserverWeb.UserComponents.status_icon user={user} />
+                  </td>
+
+                  <%= if is_moderator do %>
+                    <td>
+                      <%= if user_stats["hardware:cpuinfo"] != "" and user_stats["hardware:cpuinfo"] != nil do %>
+                        {user_stats["hardware:cpuinfo"]}
+                        <br />
+                        {user_stats["hardware:gpuinfo"]} @ {user_stats["hardware:displaymax"]}
+                      <% else %>
+                        &nbsp;
+                      <% end %>
+                    </td>
+
+                    <td>
+                      <%= if user_stats["last_ip"] != "" and user_stats["last_ip"] != nil do %>
+                        {user_stats["last_ip"]}
+                      <% end %>
+                    </td>
+                  <% end %>
+
+                  <td>
+                    {if Enum.member?(user.roles || [], "Trusted"), do: "Trusted "}
+                    {if Enum.member?(user.roles || [], "Contributor"), do: "Contributor "}
+                    {if Enum.member?(user.roles || [], "Moderator"), do: "Moderator"}
+                  </td>
+
+                  <td>
+                    {date_to_str(user.inserted_at, format: :dmy)}
+                  </td>
+
+                  <td>
+                    <a
+                      href={~p"/teiserver/admin/user/#{user.id}"}
+                      class="btn btn-secondary btn-sm"
+                    >
+                      Show
+                    </a>
+                  </td>
+
+                  <%= if is_moderator do %>
+                    <td>
+                      <a
+                        href={~p"/teiserver/admin/user/#{user.id}/edit"}
+                        class="btn btn-secondary btn-sm"
+                      >
+                        Edit
+                      </a>
+                    </td>
+                  <% end %>
+                </tr>
+              <% end %>
+            </tbody>
+          </table>
+        </div>
+
+        <%= if assigns[:total_pages] do %>
+          <.pagination
+            page={@page}
+            total_pages={@total_pages}
+            base_url={~p"/teiserver/admin/user"}
+            limit={@limit}
+            total_count={@total_count}
+            current_count={@current_count}
+            show_go_to={@total_pages > 5}
+            class="mt-3"
+            include_params={["s", "limit"]}
+            current_params={Map.merge(@conn.params, %{"limit" => @limit})}
+          />
+        <% end %>
+      </div>
+    </div>
+  </div>
+</div>

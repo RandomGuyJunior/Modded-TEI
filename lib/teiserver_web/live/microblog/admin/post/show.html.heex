@@ -1,0 +1,29 @@
+<TeiserverWeb.MicroblogComponents.sub_menu
+  active="posts"
+  view_colour={@view_colour}
+  current_user={@current_user}
+/>
+
+<div class="row mt-4">
+  <div class="col">
+    <.live_component
+      module={TeiserverWeb.Microblog.PostFormComponent}
+      id={@post.id}
+      title="Edit post"
+      action={:edit}
+      post={@post}
+      patch={~p"/microblog/admin/posts/#{@post.id}"}
+      selected_tags={@selected_tags}
+      current_user={@current_user}
+    />
+  </div>
+</div>
+
+<div class="row mt-4">
+  <div class="col">
+    <TeiserverWeb.MicroblogComponents.post_preview_small post={@post} />
+  </div>
+  <div class="col">
+    <TeiserverWeb.MicroblogComponents.post_preview_full post={@post} />
+  </div>
+</div>

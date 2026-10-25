@@ -1,0 +1,141 @@
+defmodule Teiserver.Monitoring.Tachyon do
+  @moduledoc """
+  Anything related to tachyon metrics goes there
+  """
+
+  alias Teiserver.Party
+  alias Teiserver.Player
+  alias Teiserver.TachyonLobby
+
+  use PromEx.Plugin
+
+  @tachyon_player_metrics_event_name [:prom_ex, :plugin, :tachyon, :player]
+  @tachyon_party_metrics_event_name [:prom_ex, :plugin, :tachyon, :party]
+  @tachyon_lobby_metrics_event_name [:prom_ex, :plugin, :tachyon, :lobby]
+
+  @duration_buckets [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181]
+
+  @impl PromEx.Plugin
+  def event_metrics(_opts) do
+    Event.build(
+      :teiserver_tachyon_event_metrics,
+      [
+        distribution(
+          [:teiserver, :tachyon, :request, :duration],
+          event_name: [:tachyon, :request],
+          measurement: :duration,
+          reporter_options: [
+            buckets: @duration_buckets
+          ],
+          tags: [:command_id]
+        ),
+        distribution(
+          [:teiserver, :tachyon, :connect, :duration],
+          event_name: [:tachyon, :connect],
+          measurement: :duration,
+          reporter_options: [
+            buckets: @duration_buckets
+          ]
+        ),
+        counter(
+          [:teiserver, :tachyon, :login, :ok],
+          event_name: [:tachyon, :login, :ok],
+          measurement: :count
+        ),
+        counter(
+          [:teiserver, :tachyon, :login, :error],
+          event_name: [:tachyon, :login, :error],
+          measurement: :count,
+          tags: [:reason]
+        ),
+        counter(
+          [:teiserver, :tachyon, :disconnect],
+          event_name: [:tachyon, :disconnect],
+          measurement: :count,
+          description: "normal logout with system/disconnect"
+        ),
+        counter(
+          [:teiserver, :tachyon, :abrupt_disconnect],
+          event_name: [:tachyon, :abrupt_disconnect],
+          measurement: :count,
+          description: "stopped connection without normal disconnect message"
+        ),
+        counter(
+          [:teiserver, :tachyon, :request, :count],
+          event_name: [:tachyon, :request],
+          measurement: :count,
+          tags: [:command_id, :code]
+        ),
+        counter(
+          [:teiserver, :tachyon, :event, :count],
+          event_name: [:tachyon, :event],
+          measurement: :count,
+          tags: [:command_id]
+        )
+      ]
+    )
+  end
+
+  @impl PromEx.Plugin
+  def polling_metrics(opts) do
+    poll_rate = Keyword.get(opts, :poll_rate, 5_000)
+
+    [
+      tachyon_player_metrics(poll_rate),
+      tachyon_lobby_metrics(poll_rate)
+    ]
+  end
+
+  defp tachyon_player_metrics(poll_rate) do
+    Polling.build(
+      :teiserver_tachyon_player_polling_metrics,
+      poll_rate,
+      {__MODULE__, :execute_tachyon_player_metrics, []},
+      [
+        last_value(
+          [:teiserver, :tachyon, :player, :count],
+          event_name: @tachyon_player_metrics_event_name,
+          description: "how many players are connected",
+          measurement: :count
+        ),
+        last_value(
+          [:teiserver, :tachyon, :party, :count],
+          event_name: @tachyon_party_metrics_event_name,
+          description: "how many parties",
+          measurement: :count
+        )
+      ]
+    )
+  end
+
+  defp tachyon_lobby_metrics(poll_rate) do
+    Polling.build(
+      :teiserver_tachyon_lobby_polling_metrics,
+      poll_rate,
+      {__MODULE__, :execute_tachyon_lobby_metrics, []},
+      [
+        last_value(
+          [:teiserver, :tachyon, :lobby, :count],
+          event_name: @tachyon_lobby_metrics_event_name,
+          description: "how many custom lobbies",
+          measurement: :count
+        )
+      ]
+    )
+  end
+
+  @doc false
+  def execute_tachyon_player_metrics do
+    player_count = Player.connected_count()
+    :telemetry.execute(@tachyon_player_metrics_event_name, %{count: player_count}, %{})
+
+    party_count = Party.count()
+    :telemetry.execute(@tachyon_party_metrics_event_name, %{count: party_count}, %{})
+  end
+
+  @doc false
+  def execute_tachyon_lobby_metrics do
+    lobby_count = TachyonLobby.count()
+    :telemetry.execute(@tachyon_lobby_metrics_event_name, %{count: lobby_count}, %{})
+  end
+end

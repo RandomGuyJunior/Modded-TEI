@@ -1,0 +1,124 @@
+defmodule Teiserver.Party do
+  @moduledoc """
+  Anything party related. These are only tachyon related parties, and don't
+  have anything shared with the existing parties under Teiserver.Account
+
+  The main reason is that the logic to tie parties with matchmaking is
+  completely different and there are also a few other semantic differences
+  with regard to invites.
+  """
+
+  alias Teiserver.Account.User
+  alias Teiserver.Config
+  alias Teiserver.Matchmaking
+  alias Teiserver.Party.Registry
+  alias Teiserver.Party.Server
+  alias Teiserver.Party.Supervisor
+  alias Teiserver.Party.Types, as: PT
+  alias Teiserver.Tachyon.System
+
+  @type id :: PT.Data.id()
+
+  @spec create_party(User.id(), pid() | nil) ::
+          {:ok, PT.Overview.t()} | {:error, reason :: term()}
+  def create_party(user_id, pid \\ self()) do
+    party_id = Server.gen_party_id()
+
+    case Supervisor.start_party(party_id, user_id, pid) do
+      {:ok, _server_pid} -> {:ok, Server.get_overview(party_id)}
+      {:ok, _server_pid, _info} -> {:ok, Server.get_overview(party_id)}
+      :ignore -> {:error, :ignore}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def restore_parties do
+    System.restore_state("party", __MODULE__, :restore_party)
+  end
+
+  def restore_party(id, serialized_state) do
+    Supervisor.start_party_from_snapshot(id, serialized_state)
+  end
+
+  @spec rejoin(id(), User.id()) ::
+          {:ok, PT.Overview.t()} | {:error, :invalid_party | :not_a_member}
+  def rejoin(party_id, user_id), do: rejoin(party_id, user_id, self())
+
+  @spec rejoin(id(), User.id(), pid() | nil) ::
+          {:ok, PT.Overview.t()} | {:error, :invalid_party | :not_a_member}
+  defdelegate rejoin(party_id, user_id, pid), to: Server
+
+  @spec lookup(id()) :: pid() | nil
+  defdelegate lookup(party_id), to: Registry
+
+  @spec count() :: non_neg_integer()
+  defdelegate count(), to: Registry
+
+  @spec get_overview(id()) :: PT.Overview.t() | nil
+  defdelegate get_overview(party_id), to: Server
+
+  @spec leave_party(id(), User.id()) :: :ok | {:error, :invalid_party | :not_a_member}
+  defdelegate leave_party(party_id, user_id), to: Server
+
+  @spec create_invite(id(), User.id()) ::
+          {:ok, PT.Overview.t()}
+          | {:error, :invalid_party | :already_invited | :party_at_capacity}
+  def create_invite(party_id, user_id), do: create_invite(party_id, user_id, self())
+
+  @spec create_invite(id(), User.id(), pid()) ::
+          {:ok, PT.Overview.t()}
+          | {:error, :invalid_party | :already_invited | :party_at_capacity}
+  defdelegate create_invite(party_id, user_id, pid), to: Server
+
+  @spec accept_invite(id(), User.id()) ::
+          {:ok, PT.Overview.t()} | {:error, :invalid_party | :not_invited}
+  defdelegate accept_invite(party_id, user_id), to: Server
+
+  @spec decline_invite(id(), User.id()) ::
+          {:ok, PT.Overview.t()} | {:error, :invalid_party | :not_invited}
+  defdelegate decline_invite(party_id, user_id), to: Server
+
+  @spec cancel_invite(id(), User.id()) ::
+          {:ok, PT.Overview.t()} | {:error, :invalid_party | :not_in_party | :not_invited}
+  defdelegate cancel_invite(party_id, user_id), to: Server
+
+  @spec kick_user(id(), user_kicking :: User.id(), kicked_user :: User.id()) ::
+          {:ok, PT.Overview.t()} | {:error, :invalid_party | :invalid_target | :not_a_member}
+  defdelegate kick_user(party_id, actor_id, target_id), to: Server
+
+  @spec join_queues(id(), [Matchmaking.queue_id()]) :: :ok | {:error, reason :: term()}
+  defdelegate join_queues(party_id, queues), to: Server
+
+  @spec matchmaking_notify_cancel(id()) :: :ok
+  defdelegate matchmaking_notify_cancel(party_id), to: Server
+
+  @spec send_message(id(), User.id(), String.t()) ::
+          :ok | {:error, :invalid_request, reason :: term()}
+  defdelegate send_message(party_id, from_id, msg_content), to: Server
+
+  def setup_site_configs do
+    Config.add_site_config_type(%{
+      key: Server.max_size_key(),
+      section: "Tachyon",
+      type: "integer",
+      permissions: ["Admin"],
+      description: "Maximum number of member + invited for parties",
+      default: 3
+    })
+
+    Config.add_site_config_type(%{
+      key: Server.invite_valid_duration_key(),
+      section: "Tachyon",
+      type: "integer",
+      permissions: ["Admin"],
+      description: "How long a party invite should be valid for (in seconds)",
+      default: 60 * 5
+    })
+  end
+
+  @spec update_max_size(integer()) :: :ok
+  def update_max_size(new_max_size) do
+    Config.update_site_config(Server.max_size_key(), new_max_size)
+    :ok
+  end
+end

@@ -1,0 +1,100 @@
+<% bsname = view_colour() %>
+
+<TeiserverWeb.Moderation.ModerationComponents.sub_menu
+  active="actions"
+  view_colour={view_colour()}
+/>
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <TeiserverWeb.Components.Moderation.ActionComponents.section_menu
+          active={if assigns[:show_search], do: "search", else: "index"}
+          colour={bsname}
+        />
+
+        <%= if @conn.params["search"] != nil or assigns[:show_search] do %>
+          {render(TeiserverWeb.Moderation.ActionView, "search.html", assigns)}
+        <% end %>
+
+        <h4>Listing Actions</h4>
+
+        <div class="table-responsive">
+          <table class="table table-sm">
+            <thead>
+              <tr>
+                <th>Name</th>
+
+                <th>Reason</th>
+                <th>Restrictions</th>
+
+                <th>Started</th>
+                <th>Expires</th>
+                <th>Duration</th>
+
+                <th colspan="2">&nbsp;</th>
+              </tr>
+            </thead>
+            <tbody>
+              <%= for action <- @actions do %>
+                <tr>
+                  <td>{action.target.name}</td>
+                  <td>{action.reason |> String.slice(0..100)}</td>
+                  <td>{action.restrictions |> Enum.join(", ")}</td>
+
+                  <td>{action.inserted_at |> date_to_str(format: :hms_or_ymd)}</td>
+                  <%= if action.expires do %>
+                    <%= if NaiveDateTime.compare(NaiveDateTime.utc_now(), action.expires) == :gt do %>
+                      <td>Expired</td>
+                    <% else %>
+                      <td>{action.expires |> date_to_str(format: :hms_or_ymd)}</td>
+                    <% end %>
+
+                    <td>{duration_to_str(action.inserted_at, action.expires)}</td>
+                  <% else %>
+                    <td colspan="2" class="text-warning">
+                      Permanent
+                    </td>
+                  <% end %>
+
+                  <td>
+                    <a href={~p"/moderation/action/#{action.id}"} class="btn btn-secondary btn-sm">
+                      Show
+                    </a>
+                  </td>
+
+                  <td>
+                    <%= if allow?(@conn, "Moderator") do %>
+                      <a
+                        href={~p"/teiserver/admin/user/#{action.target_id}"}
+                        class="btn btn-secondary btn-sm"
+                      >
+                        User
+                      </a>
+                    <% end %>
+                  </td>
+                </tr>
+              <% end %>
+            </tbody>
+          </table>
+        </div>
+
+        <%= if assigns[:total_pages] do %>
+          <.pagination
+            page={@page}
+            total_pages={@total_pages}
+            base_url={~p"/moderation/action"}
+            limit={@limit}
+            total_count={@total_count}
+            current_count={@current_count}
+            show_go_to={@total_pages > 5}
+            class="mt-3"
+            include_params={["search", "target_id", "reporter_id", "expiry", "order", "limit"]}
+            current_params={@conn.params}
+          />
+        <% end %>
+      </div>
+    </div>
+  </div>
+</div>

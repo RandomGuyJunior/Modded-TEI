@@ -1,0 +1,46 @@
+{
+    "$id": "https://schema.beyondallreason.dev/tachyon/definitions/privateBattle.json",
+    "title": "PrivateBattle",
+    "description": "Battle informations including secrets to pass to spring for joining the game server. Don't expose secrets to other players.",
+    "type": "object",
+    "properties": {
+        "battleId": { "$ref": "../definitions/battleId.json" },
+        "username": { "type": "string" },
+        "password": { "type": "string" },
+        "ips": {
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    { "type": "string", "format": "ipv4" },
+                    { "type": "string", "format": "ipv6" }
+                ]
+            }
+        },
+        "port": { "type": "integer", "minimum": 1024, "maximum": 65535 },
+        "engine": {
+            "type": "object",
+            "properties": { "version": { "type": "string" } },
+            "required": ["version"]
+        },
+        "game": {
+            "type": "object",
+            "properties": { "springName": { "type": "string" } },
+            "required": ["springName"]
+        },
+        "map": {
+            "type": "object",
+            "properties": { "springName": { "type": "string" } },
+            "required": ["springName"]
+        }
+    },
+    "required": [
+        "battleId",
+        "username",
+        "password",
+        "ips",
+        "port",
+        "engine",
+        "game",
+        "map"
+    ]
+}

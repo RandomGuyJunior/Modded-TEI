@@ -1,0 +1,35 @@
+<% bsname = view_colour() %>
+
+<div class="row">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname} page-card"}>
+      <div class="card-body">
+        <form
+          action={~p"/logging/page_views/search"}
+          method="post"
+          class="form-horizontal"
+        >
+          <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+
+          <div class="form-group">
+            <div class="col-md-4 col-xl-2">
+              <label for="teiserver-user-search" class="control-label">Specific user: </label>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <div class="offset-md-8 col-md-4 offset-xl-10 col-xl-2">
+              &nbsp;<br />
+              <input
+                type="submit"
+                value="Search"
+                name="form.submitted"
+                class={"btn btn-#{bsname} btn-block"}
+              />
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>

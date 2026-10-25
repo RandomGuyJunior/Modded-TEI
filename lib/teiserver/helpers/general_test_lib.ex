@@ -1,0 +1,138 @@
+defmodule Teiserver.Helpers.GeneralTestLib do
+  @moduledoc false
+
+  alias Teiserver.Account
+  alias Teiserver.Account.Guardian
+  alias Teiserver.Account.Scope
+  alias Teiserver.Account.User
+  alias Teiserver.Helper.StringHelper
+  alias TeiserverWeb.UserSocket
+
+  import Phoenix.ChannelTest
+  import Phoenix.ConnTest, only: [build_conn: 0, post: 3]
+
+  @endpoint TeiserverWeb.Endpoint
+
+  # def make_combos(data), do: CombinatorLib.make_combos(data)
+
+  def user_fixture, do: make_user(%{"permissions" => []})
+
+  # TODO: This should be replaced by AccountFixtures.user_fixture()
+  # unfortunately they have different signatures so it's not a find
+  # and replace
+  def make_user(params \\ %{}) do
+    name = StringHelper.random_name(15)
+
+    {:ok, u} =
+      Account.create_user(%{
+        "name" => params["name"] || "TEST_#{name}",
+        "email" => params["email"] || "email@email#{:rand.uniform(999_999_999_999)}",
+        "colour" => params["colour"] || "#00AA00",
+        "icon" => params["icon"] || "fa-solid fa-user",
+        "permissions" => [],
+        "roles" => params["roles"] || [],
+        "password" =>
+          params["password"] ||
+            Account.spring_md5_password("password"),
+        "password_confirmation" => params["password"] || "password",
+        "restrictions" => params["restrictions"] || [],
+        "data" => params["data"] || %{}
+      })
+
+    u
+  end
+
+  def login(conn, email) do
+    conn
+    |> post("/login", %{"user" => %{email: email, password: "password"}})
+  end
+
+  def login_opt(conn, user, otp) do
+    conn
+    |> post("/otp", %{"user_id" => user.id, "otp" => otp})
+  end
+
+  def data_setup(flags \\ []) do
+    user =
+      if :user in flags do
+        make_user(%{
+          "name" => "current_user",
+          "email" => "current_user@current_user.com",
+          "permissions" => []
+        })
+      end
+
+    {:ok, user: user}
+  end
+
+  # Used for those that need to create additional connections
+  def new_conn(nil), do: login(build_conn(), "")
+
+  def new_conn(user) do
+    {:ok, jwt, _full_claims} = Guardian.encode_and_sign(user)
+    {:ok, user, _claims} = Guardian.resource_from_token(jwt)
+
+    login(build_conn(), user.email)
+  end
+
+  # TODO: This should be refactored into a single opts argument
+  # with the possibility for roles, flags and other rarely used arguments
+  # being part of that
+  def conn_setup(roles \\ [], flags \\ []) do
+    {:ok, _data} = data_setup(flags)
+
+    r = :rand.uniform(999_999_999)
+
+    {user, jwt} =
+      if :no_user in flags do
+        {nil, nil}
+      else
+        user =
+          make_user(%{
+            "email" => "current_user#{r}@current_user#{r}.com",
+            "roles" => roles
+          })
+
+        # Tokens
+        {:ok, jwt, _full_claims} = Guardian.encode_and_sign(user)
+        {:ok, user, _claims} = Guardian.resource_from_token(jwt)
+        {user, jwt}
+      end
+
+    # Connection and socket stuff
+    # conn = build_conn()
+    # |> Guardian.Plug.sign_in(user, %{some: "claim"})
+    # |> Guardian.Plug.remember_me(user)
+
+    conn =
+      if :no_login in flags or :no_user in flags do
+        # build_conn()
+        login(build_conn(), "")
+      else
+        login(build_conn(), user.email)
+      end
+
+    socket =
+      if flags[:socket] do
+        case connect(UserSocket, %{"token" => jwt}) do
+          {:ok, socket} ->
+            socket
+
+          _e ->
+            raise "Error connecting to socket in test_lib"
+        end
+      end
+
+    {:ok, r: r, user: user, jwt: jwt, conn: conn, user_token: jwt, socket: socket}
+  end
+
+  @doc """
+  Creates a scope fixture from the user provided
+  """
+  def scope_fixture(%User{} = user, attrs \\ %{}) do
+    %Scope{
+      user: user,
+      ip: attrs[:ip] || {0, 0, 0, 0, 0, 0, 0, 1}
+    }
+  end
+end

@@ -1,0 +1,150 @@
+<% bsname = view_colour() %>
+
+{render(
+  TeiserverWeb.Report.GeneralView,
+  "sub_menu.html",
+  Map.merge(assigns, %{active: "reports"})
+)}
+
+<script src={~p"/js/d3.js"}>
+</script>
+<script src={~p"/js/c3.min.js"}>
+</script>
+
+<link href="/css/c3.min.css" rel="stylesheet" />
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <div
+          class="btn btn-primary2 float-end"
+          onclick="$('.old-help-box, .old-help-box-large').toggle();"
+        >
+          <i class="fa-fw fa-solid fa-circle-info"></i> &nbsp;
+          Show/Hide help
+        </div>
+        <br /><br />
+
+        <form
+          action={~p"/teiserver/reports/show/population"}
+          method="post"
+          class="form-horizontal"
+        >
+          <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+
+          <div class="row">
+            <div class="col-md-4 col-lg-3 col-xl-2 search-form-input">
+              <label for="report_metric" class="control-label">Metric:</label>
+              {select(
+                :report,
+                :metric,
+                [
+                  "Client name",
+                  "Country code",
+                  "Operating system",
+                  "GPU manufacturer",
+                  "CPU manufacturer",
+                  "Display size",
+                  "Spring rank"
+                ],
+                class: "form-control",
+                selected: @params["metric"]
+              )}
+            </div>
+
+            <div class="col-md-3 col-xl-2 search-form-input">
+              <label for="report_last_login" class="control-label">Last login:</label>
+              {select(:report, :last_login, @presets,
+                class: "form-control",
+                selected: @params["last_login"]
+              )}
+            </div>
+
+            <div class="col-md-3 col-xl-2 search-form-input">
+              <label for="report_registered" class="control-label">Registered:</label>
+              {select(:report, :registered, @presets,
+                class: "form-control",
+                selected: @params["registered"]
+              )}
+            </div>
+
+            <div class="col-md-3 col-xl-2 search-form-input">
+              <label for="report_exclude_bots" class="control-label">Exclude bots:</label>
+              <.input
+                type="checkbox"
+                id="report_exclude_bots"
+                name="report[exclude_bots]"
+                checked={@params["exclude_bots"] == "true"}
+                label=""
+                value="true"
+              />
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="col-md-12">
+              &nbsp;<br />
+              <input
+                type="submit"
+                value="Update report"
+                name="form.submitted"
+                class={"float-end btn btn-#{bsname}"}
+              />
+            </div>
+
+            <div class="col-md-12">
+              <div class="old-help-box-large">
+                Each count is based on the number of users falling into that bucket with their last registered value. This means a user who previously used client X but is now using client Y will show up as client Y.
+              </div>
+            </div>
+          </div>
+        </form>
+        <br /><br />
+
+        <div class="row">
+          <div class="col-lg-6 col-xl-3">
+            <h4>Results</h4>
+            <table class="table table-sm">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>{@params["metric"]}</th>
+                  <th>Count</th>
+                  <th>Percentage</th>
+                </tr>
+              </thead>
+              <tbody>
+                <%= for {[key, count], index} <- Enum.with_index(@data) do %>
+                  <tr>
+                    <td>{index + 1}</td>
+                    <td>{key}</td>
+                    <td>{count |> format_number()}</td>
+                    <td>{(count / @stats[:total]) |> percent(1)}%</td>
+                  </tr>
+                <% end %>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="col-lg-6 col-xl-3">
+            <h4>Stats</h4>
+            <table class="table table-sm">
+              <tbody>
+                <%= for {key, value} <- @stats do %>
+                  <tr>
+                    <td>{key}</td>
+                    <td>{value |> format_number()}</td>
+                  </tr>
+                <% end %>
+              </tbody>
+            </table>
+
+            <h5 class="mt-4">CSV data (tabbed)</h5>
+            <textarea rows="3" class="form-control" style="font-family: monospace;"><%= @csv_data %></textarea>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

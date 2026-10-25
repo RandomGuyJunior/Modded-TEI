@@ -1,0 +1,110 @@
+<% bsname = view_colour() %>
+
+<script type="text/javascript" charset="utf-8">
+  $(function() {
+    var selected_tab = window.location.hash.substr(1).replace("_tab", "");
+    $('#the_tabs a:first').tab('show');
+    $('#the_tabs [href="#' + selected_tab + '_tab"]').tab('show');
+  });
+</script>
+
+<TeiserverWeb.Moderation.ModerationComponents.sub_menu
+  active="reports"
+  view_colour={view_colour()}
+/>
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <div class="float-end">
+          <a class={"btn btn-outline-#{bsname}"} href={~p"/moderation/report_user/#{@user.id}"}>
+            <Fontawesome.icon icon={icon()} style="solid" /> &nbsp;
+            Report form
+          </a>
+
+          <%= if allow?(@conn, "Moderator") do %>
+            <a
+              class={"btn btn-outline-#{Teiserver.Moderation.ActionLib.colour()}"}
+              href={~p"/moderation/action/new_with_user?teiserver_user=#{@user.id}"}
+            >
+              <Fontawesome.icon icon={Teiserver.Moderation.ActionLib.icon()} style="solid" />
+              &nbsp;
+              Action user
+            </a>
+          <% end %>
+
+          <%= if allow?(@conn, "Moderator") do %>
+            <a
+              class={"btn btn-outline-#{Teiserver.Account.UserLib.colour()}"}
+              href={~p"/teiserver/admin/user/#{@user}"}
+            >
+              <Fontawesome.icon icon={Teiserver.Account.UserLib.icon()} style="solid" /> &nbsp;
+              View user
+            </a>
+
+            <a
+              class={"btn btn-outline-#{Teiserver.Account.UserLib.colour()}"}
+              href={~p"/teiserver/admin/users/smurf_search/#{@user}"}
+            >
+              <Fontawesome.icon icon="face-angry" style="solid" /> &nbsp;
+              Smurf search
+            </a>
+          <% end %>
+        </div>
+
+        <h3 style={"color: #{@user.colour}"}>
+          {@user.name} &nbsp; <Fontawesome.icon icon={@user.icon} style="solid" />
+        </h3>
+
+        <ul class="nav nav-tabs" role="tablist" id="the_tabs">
+          <li class="nav-item" role="presentation">
+            <a href="#overview_tab" role="tab" class="nav-link" data-bs-toggle="tab">
+              <Fontawesome.icon icon="fa-solid fa-bullseye-pointer" style="regular" />
+              Reports against ({Enum.count(@reports_against)})
+            </a>
+          </li>
+
+          <li class="nav-item" role="presentation">
+            <a href="#details_tab" role="tab" class="nav-link" data-bs-toggle="tab">
+              <Fontawesome.icon icon="fa-solid fa-share-from-square" style="regular" />
+              Reports made ({Enum.count(@reports_made)})
+            </a>
+          </li>
+
+          <li class="nav-item" role="presentation">
+            <a href="#actions_tab" role="tab" class="nav-link" data-bs-toggle="tab">
+              <Fontawesome.icon icon={Teiserver.Moderation.ActionLib.icon()} style="solid" />
+              Actions ({Enum.count(@actions)})
+            </a>
+          </li>
+
+          <li class="nav-item" role="presentation">
+            <a href="#user_details_tab" role="tab" class="nav-link" data-bs-toggle="tab">
+              <Fontawesome.icon icon={Teiserver.Account.UserLib.icon()} style="regular" />
+              User details
+            </a>
+          </li>
+        </ul>
+
+        <div class="tab-content">
+          <div class="tab-pane" id="overview_tab" style="padding:5px;">
+            {render("tab_against.html", assigns)}
+          </div>
+
+          <div class="tab-pane" id="details_tab" style="padding:5px;">
+            {render("tab_from.html", assigns)}
+          </div>
+
+          <div class="tab-pane" id="actions_tab" style="padding:5px;">
+            {render("tab_actions.html", assigns)}
+          </div>
+
+          <div class="tab-pane" id="user_details_tab" style="padding:5px;">
+            {render("tab_user_details.html", assigns)}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

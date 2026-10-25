@@ -1,0 +1,71 @@
+<% bsname = view_colour() %>
+
+<script type="text/javascript" charset="utf-8">
+  $(function() {
+    $('.datepicker').datepicker({
+      format: "dd/mm/yyyy"
+    });
+  });
+</script>
+
+<div class="row">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname} page-card"}>
+      <div class="card-body">
+        <div class={"btn btn-outline-#{bsname}"} onclick="show_search();" id="search-box-shower">
+          <i class="fa-solid fa-fw fa-search"></i> Show search form
+        </div>
+
+        <form
+          action={~p"/teiserver/admin/matches"}
+          method="get"
+          class="form-horizontal"
+          id="search-box"
+          style="display: none;"
+        >
+          <input type="hidden" name="search" value="true" />
+
+          <div class="row">
+            <div class="col-md-4 col-lg-3 col-xl-2 my-2">
+              <label for="account_user" class="control-label">User: </label>
+              <input
+                type="text"
+                name="account_user"
+                id="account_user"
+                value={@params["account_user"]}
+                placeholder="Username (partial OK, e.g., SomePlayer or Some)"
+                class="form-control"
+              />
+            </div>
+
+            <div class="col-md-4 col-lg-3 col-xl-2 my-2">
+              <.input
+                type="select"
+                id="search_game_type"
+                name="game_type"
+                label="Game type"
+                value={@params["game_type"] || "Any"}
+                options={[
+                  {"Any", ""},
+                  "Duel",
+                  "Small Team",
+                  "Large Team",
+                  "FFA",
+                  "Team FFA",
+                  "Scavengers",
+                  "Raptors",
+                  "Bots"
+                ]}
+              />
+            </div>
+
+            <div class="offset-md-8 col-md-4 offset-xl-10 col-xl-2">
+              &nbsp;<br />
+              <input type="submit" value="Search" class={"btn btn-#{bsname} btn-block"} />
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,28 @@
+defmodule Teiserver.TachyonLobby.System do
+  @moduledoc """
+  All the processes and supervisors to support lobbies (creation and listing)
+  """
+
+  alias Teiserver.TachyonLobby
+
+  use Supervisor
+
+  def start_link(init_arg) do
+    Supervisor.start_link(__MODULE__, init_arg, name: __MODULE__)
+  end
+
+  @impl Supervisor
+  def init(_arg) do
+    children = [
+      TachyonLobby.Registry,
+      TachyonLobby.Supervisor,
+      TachyonLobby.ListMonitor,
+      Supervisor.child_spec(
+        {Teiserver.Tachyon.SyncTask, %{mfa: [Teiserver.TachyonLobby, :restore_lobbies, []]}},
+        id: RestoreLobbyTask
+      )
+    ]
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+end

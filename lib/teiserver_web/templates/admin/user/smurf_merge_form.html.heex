@@ -1,0 +1,168 @@
+<% bsname = view_colour() %>
+
+<style type="text/css">
+  .inactive {
+    border-left: 5px solid #AAA;
+    background-color: #444;
+    color: #999;
+  }
+</style>
+
+<div class="row">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        <TeiserverWeb.Components.Admin.UserComponents.section_menu
+          active="smurf_merge_form"
+          colour={bsname}
+          current_user={@current_user}
+        />
+
+        <hr />
+
+        <h4>
+          {@from_user.name} (Original)
+          &nbsp; <i class="fa-fw fa-solid fa-arrow-right"></i>
+          &nbsp; {@to_user.name} (New user, the smurf)
+        </h4>
+        Anything in a gray box won't have an effect at this stage.
+
+        <!--
+        Creating a link between these two users will mean:
+        <ul>
+          <li>Rating updates applied to one will apply to the other</li>
+          <li>Moderation actions applied to one will be silently applied to the other</li>
+          <li>Mutes applied to one will be applied to the other</li>
+        </ul>
+        -->
+        <form
+          action={~p"/teiserver/admin/users/smurf_merge_post/#{@from_user.id}/#{@to_user.id}"}
+          method="post"
+          class=""
+        >
+          <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+
+          <div class="row">
+            <div class="col-md-12 m-3 inactive">
+              <h5 class="text-primary">
+                <Fontawesome.icon icon="fa-solid fa-link" style="regular" /> &nbsp;
+                <label for="" class="control-label">Link accounts</label>
+              </h5>
+              <.input
+                type="checkbox"
+                id="merge_link_create"
+                name="merge[link]"
+                checked={true}
+                label="Create link"
+                description="A smurf link between the two accounts will be created"
+                value={true}
+              />
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="col-md-12 m-3">
+              <h5 class={"text-#{Teiserver.Account.RatingLib.colours}"}>
+                <Fontawesome.icon icon={Teiserver.Account.RatingLib.icon()} style="regular" />
+                &nbsp; <label for="" class="control-label">Ratings</label>
+              </h5>
+              <.input
+                type="checkbox"
+                id="merge_ratings_pick_highest"
+                name="merge[ratings]"
+                checked={true}
+                label="Pick highest value"
+                description="The highest score from each user will be used for each rating"
+                value={true}
+              />
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="col-md-12 m-3">
+              <h5 class="text-warning">
+                <Fontawesome.icon
+                  icon={Teiserver.Helper.StylingHelper.icon(:moderation)}
+                  style="regular"
+                /> &nbsp; <label for="" class="control-label">Moderation reports/actions</label>
+              </h5>
+              <.input
+                type="checkbox"
+                id="merge_reports_copy"
+                name="merge[reports]"
+                checked={true}
+                label="Copy"
+                description={"Reports for #{@from_user.name} will be duplicated to #{@to_user.name}"}
+                value={true}
+              />
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="col-md-12 m-3">
+              <h5 class="text-danger">
+                <Fontawesome.icon
+                  icon={Teiserver.Account.RelationshipReport.icon()}
+                  style="regular"
+                /> &nbsp; <label for="" class="control-label">Mutes/Ignores</label>
+              </h5>
+              <.input
+                type="checkbox"
+                id="merge_mutes_duplicate"
+                name="merge[mutes]"
+                checked={true}
+                label="Duplicate"
+                description={"Users who have muted #{@from_user.name} will add #{@to_user.name} as a mute"}
+                value={true}
+              />
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="col-md-12 m-3">
+              <h5 class="text-info2">
+                <Fontawesome.icon icon="fa-solid fa-input-text" style="regular" /> &nbsp;
+                <label for="" class="control-label">Names</label>
+              </h5>
+              <.input
+                type="checkbox"
+                id="merge_names_duplicate"
+                name="merge[names]"
+                checked={true}
+                label="Duplicate"
+                description={"Past names used by #{@from_user.name} will be copied over to #{@to_user.name}"}
+                value={true}
+              />
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="col-md-12 m-3 inactive">
+              <h5 class="text-warning2">
+                <Fontawesome.icon icon={Teiserver.Account.UserLib.icon()} style="regular" />
+                &nbsp; <label for="" class="control-label">Old account ({@from_user.name})</label>
+              </h5>
+              <.input
+                type="checkbox"
+                id="merge_old_account_deactivate"
+                name="merge[old_account]"
+                checked={true}
+                label="Deactivate"
+                description={"The account #{@from_user.name} will be deactivated"}
+                value={true}
+              />
+            </div>
+          </div>
+
+          <a href={~p"/teiserver/admin/user/#{@to_user}"} class="btn btn-secondary">
+            Cancel
+          </a>
+
+          <button type="submit" class={"btn btn-#{bsname} float-end"}>
+            Apply
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,39 @@
+defmodule Teiserver.Party.Registry do
+  @moduledoc """
+  Tracks tachyon parties
+  """
+
+  alias Teiserver.Party.Types, as: PT
+
+  @spec lookup(PT.Data.id()) :: pid() | nil
+  def lookup(party_id) do
+    case Registry.lookup(__MODULE__, party_id) do
+      [{pid, _value}] -> pid
+      _other -> nil
+    end
+  end
+
+  @spec count() :: non_neg_integer()
+  def count do
+    Registry.count(__MODULE__)
+  rescue
+    # when the registry isn't up (yet), can happen with telemetry polling
+    # %ArgumentError{message: "unknown registry: Teiserver.Party.Registry"}
+    _e in ArgumentError -> 0
+  end
+
+  def start_link do
+    Registry.start_link(keys: :unique, name: __MODULE__)
+  end
+
+  def child_spec(_opts) do
+    Supervisor.child_spec(Registry,
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, []}
+    )
+  end
+
+  def via_tuple(party_id) do
+    {:via, Registry, {__MODULE__, party_id}}
+  end
+end

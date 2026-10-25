@@ -1,0 +1,688 @@
+defmodule Teiserver.Matchmaking.QueueServer do
+  @moduledoc """
+  Very similar to Teiserver.Game.QueueWaitServer
+
+  This process manages a given queue and attempt to match the members to play
+  matches. Once player are matched, they are excluded from this queue and passed
+  to a QueueRoomServer
+  It also has some associated state for telemetry.
+  """
+
+  alias Teiserver.Account.User
+  alias Teiserver.Battle.MatchLib
+  alias Teiserver.Helpers.MonitorCollection, as: MC
+  alias Teiserver.Matchmaking
+  alias Teiserver.Matchmaking.Algo
+  alias Teiserver.Matchmaking.Member
+  alias Teiserver.Matchmaking.PairingRoom
+  alias Teiserver.Matchmaking.QueueRegistry
+  alias Teiserver.Party
+  alias Teiserver.Player
+
+  use GenServer
+
+  require Logger
+
+  @type id :: String.t()
+
+  # Internal queue statistics (without player_count)
+  @typep internal_stats :: %{
+           total_joined: non_neg_integer(),
+           total_left: non_neg_integer(),
+           total_wait_time_s: non_neg_integer(),
+           total_matched: non_neg_integer()
+         }
+  @typedoc """
+  Queue statistics for monitoring (includes player_count)
+  """
+  @type stats :: %{
+          total_joined: non_neg_integer(),
+          total_left: non_neg_integer(),
+          total_wait_time_s: non_neg_integer(),
+          total_matched: non_neg_integer(),
+          player_count: non_neg_integer()
+        }
+
+  @typedoc """
+  Internal settings for the queue so it's easier to control the frequency of
+  ticks and whatnot
+  """
+  @type settings :: %{
+          tick_interval_ms: pos_integer() | :manual,
+          max_distance: pos_integer(),
+          pairing_timeout: timeout()
+        }
+
+  @typedoc """
+  what algorithm this queue should use to put players/party together?
+  """
+  @type algo :: {module(), term()}
+
+  @typedoc """
+  immutable specification of the queue
+  """
+  @type queue :: %{
+          name: String.t(),
+          team_size: pos_integer(),
+          team_count: pos_integer(),
+          ranked: boolean(),
+          algo: algo(),
+          engines: [%{version: String.t()}],
+          games: [%{spring_game: String.t()}],
+          maps: [Teiserver.Asset.Map.t()],
+          version: String.t()
+        }
+
+  @type state :: %{
+          id: id(),
+          queue: queue(),
+          settings: settings(),
+          members: [Member.t()],
+          # storing monitors to evict players that disconnect
+          # also store pairing rooms
+          monitors: MC.t(),
+          # list of pairing rooms and which players are in it
+          pairings: [{pid(), [User.id()]}],
+
+          # a buffer when a party is joining, to make sure all player are indeed
+          # committed to joining this queue
+          pending_parties: %{
+            Party.id() => %{
+              waiting_for: [User.id()],
+              joined: [User.id()],
+              sess_pids: [pid()],
+              member: Member.t(),
+              tref: :timer.tref()
+            }
+          },
+
+          # queue statistics for monitoring
+          stats: internal_stats()
+        }
+
+  @type cancelled_reason ::
+          :intentional | {:server_error, term()} | :party_user_left | :ready_timeout
+
+  @spec default_settings() :: settings()
+  def default_settings do
+    %{tick_interval_ms: 5_000, max_distance: 15, pairing_timeout: 20_000}
+  end
+
+  @doc """
+  Create a state for the GenServer, filling missing attributes with defaults
+  """
+  @spec init_state(%{
+          required(:id) => id(),
+          required(:name) => String.t(),
+          required(:team_size) => pos_integer(),
+          required(:team_count) => pos_integer(),
+          required(:engines) => [%{version: String.t()}],
+          required(:games) => [%{spring_game: String.t()}],
+          required(:maps) => [Teiserver.Asset.Map.t()],
+          optional(:settings) => settings(),
+          optional(:members) => [Member.t()],
+          optional(:algo) => :ignore_os | :bruteforce_filter
+        }) :: state()
+  def init_state(attrs) do
+    alg_module =
+      case Map.get(attrs, :algo, :ignore_os) do
+        :ignore_os -> Algo.IgnoreOs
+        :bruteforce_filter -> Algo.BruteforceFilter
+      end
+
+    alg_state = apply(alg_module, :init, [attrs.team_size, attrs.team_count])
+
+    %{
+      id: attrs.id,
+      queue: %{
+        name: attrs.name,
+        team_size: attrs.team_size,
+        team_count: attrs.team_count,
+        algo: {alg_module, alg_state},
+        ranked: true,
+        engines: attrs.engines,
+        games: attrs.games,
+        maps: attrs.maps,
+        version: compute_version(attrs.engines, attrs.games, attrs.maps)
+      },
+      settings: Map.merge(default_settings(), Map.get(attrs, :settings, %{})),
+      members: Map.get(attrs, :members, []),
+      monitors: MC.new(),
+      pairings: [],
+      pending_parties: %{},
+      stats: %{
+        total_joined: 0,
+        total_left: 0,
+        total_wait_time_s: 0,
+        total_matched: 0
+      }
+    }
+  end
+
+  def via_tuple(queue_id) do
+    QueueRegistry.via_tuple(queue_id)
+  end
+
+  def via_tuple(queue_id, queue) do
+    QueueRegistry.via_tuple(queue_id, queue)
+  end
+
+  @type join_error ::
+          {:error,
+           :invalid_queue
+           | :version_mismatch
+           | :already_queued
+           | :too_many_players
+           | :missing_engines
+           | :missing_games
+           | :missing_maps
+           | :party_too_big}
+  @type join_result :: {:ok, queue_pid :: pid()} | join_error()
+
+  @doc """
+  Join the specified queue
+  """
+  @spec join_queue(id(), version :: String.t(), User.id(), Party.id() | nil) :: join_result()
+  def join_queue(queue_id, version, user_id, party_id) do
+    sess_pid = self()
+
+    if party_id == nil do
+      game_type = queue_id |> via_tuple() |> GenServer.call(:get_game_type)
+      member = Member.new([user_id], game_type)
+      queue_id |> via_tuple() |> GenServer.call({:join_queue, version, {member, sess_pid}})
+    else
+      queue_id
+      |> via_tuple()
+      |> GenServer.call({:join_queue, version, {user_id, sess_pid}, party_id})
+    end
+  catch
+    :exit, {:noproc, _details} -> {:error, :invalid_queue}
+  end
+
+  @doc """
+  Creates a "slot" in the queue for the party member to then join the queue.
+  All members must then call party_member_join_queue within a short time
+  or the operation is cancelled and all players already joined are kicked out
+  of the queue.
+  This is to ensure all party member are there as a unit and avoid race where
+  a member could disconnect in the middle of the joining process.
+  """
+  @spec party_join_queue(id(), version :: String.t(), Party.id(), [User.id()]) ::
+          {:ok, queue_pid :: pid()} | {:error, reason :: term()}
+  def party_join_queue(queue_id, version, party_id, player_ids) do
+    game_type = queue_id |> via_tuple() |> GenServer.call(:get_game_type)
+    member = %{Member.new(player_ids, game_type) | party_id: party_id}
+    queue_id |> via_tuple() |> GenServer.call({:party_join_queue, version, party_id, member})
+  catch
+    :exit, {:noproc, _details} -> {:no, :invalid_queue}
+  end
+
+  @type leave_result :: :ok | {:error, {:not_queued, :invalid_queue}}
+
+  @doc """
+  Leave the specified queue. If the given player is a member of a party, then
+  the entire party will leave the queue
+  """
+  @spec leave_queue(id(), User.id()) :: leave_result()
+  def leave_queue(queue_id, player_id) do
+    queue_id |> via_tuple() |> GenServer.call({:leave_queue, player_id})
+  catch
+    :exit, {:noproc, _details} -> {:error, :invalid_queue}
+    :exit, {:shutdown, _reason} -> :ok
+  end
+
+  @doc """
+  When a pairing rooms times out or a player decline. Mark the players there
+  as not pairing anymore, and should be removed from the queue.
+  Rejoining should be done by the player themselves.
+  """
+  @spec disband_pairing(id(), pid()) :: :ok
+  def disband_pairing(queue_id, room_pid) do
+    queue_id |> via_tuple() |> GenServer.call({:disband_pairing, room_pid})
+  catch
+    # if the queue is gone for whatever reason, the pairing room should be
+    # killed as well, and nothing will happen
+    :exit, {:noproc, _details} -> :ok
+  end
+
+  @spec start_link(state()) :: GenServer.on_start()
+  def start_link(initial_state) do
+    GenServer.start_link(__MODULE__, initial_state,
+      name: via_tuple(initial_state.id, initial_state.queue)
+    )
+  end
+
+  @doc """
+  used for testing only, to force a pairing of players so one can test the rest
+  of the flow.
+  """
+  def match_players(queue_pid) when is_pid(queue_pid), do: send(queue_pid, :tick)
+
+  @impl GenServer
+  def init(state) do
+    Logger.metadata(actor_type: :mm_queue, actor_id: state.id)
+
+    if state.settings.tick_interval_ms != :manual do
+      :timer.send_interval(state.settings.tick_interval_ms, :tick)
+    end
+
+    {:ok, state}
+  end
+
+  @impl GenServer
+  def handle_call(:get_game_type, _from, state) do
+    game_type = MatchLib.game_type(state.queue.team_size, state.queue.team_count)
+    {:reply, game_type, state}
+  end
+
+  def handle_call({:join_queue, version, _member_data}, _from, state)
+      when state.queue.version != version,
+      do: {:reply, {:error, :version_mismatch}, state}
+
+  def handle_call({:join_queue, _version, {new_member, sess_pid}}, _from, state) do
+    case member_can_join_queue?(new_member.player_ids, state) do
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+
+      :ok ->
+        [player_id] = new_member.player_ids
+
+        new_state =
+          state
+          |> add_member_to_queue(new_member, [{player_id, sess_pid}])
+          |> update_in([:stats, :total_joined], &(&1 + 1))
+
+        broadcast_update(new_state)
+        {:reply, {:ok, self()}, new_state}
+    end
+  end
+
+  def handle_call({:join_queue, version, _player_data, _party_id}, _from, state)
+      when state.queue.version != version,
+      do: {:reply, {:error, :version_mismatch}, state}
+
+  def handle_call({:join_queue, _version, {player_id, sess_pid}, party_id}, _from, state) do
+    with :ok <- member_can_join_queue?([player_id], state),
+         pending when pending != nil <- Map.get(state.pending_parties, party_id) do
+      case Enum.split_with(pending.waiting_for, &(&1 == player_id)) do
+        {[], _rest} ->
+          {:reply, {:error, :invalid_queue}, state}
+
+        {[_player_id], []} ->
+          member = pending.member
+          :timer.cancel(pending.tref)
+
+          new_state =
+            state
+            |> Map.update!(:pending_parties, &Map.delete(&1, party_id))
+            |> add_member_to_queue(member, pending.sess_pids)
+            |> update_in([:stats, :total_joined], &(&1 + length(member.player_ids)))
+
+          Logger.info("Party #{party_id} with members #{inspect(member.player_ids)} joined queue")
+
+          broadcast_update(new_state)
+          {:reply, {:ok, self()}, new_state}
+
+        {[_player_id], rest} ->
+          pending =
+            pending
+            |> Map.replace!(:waiting_for, rest)
+            |> Map.update!(:joined, fn js -> [player_id | js] end)
+            |> Map.update!(:sess_pids, fn pids -> [{player_id, sess_pid} | pids] end)
+
+          new_state =
+            state
+            |> put_in([:pending_parties, party_id], pending)
+
+          {:reply, {:ok, self()}, new_state}
+      end
+    else
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+
+      nil ->
+        {:reply, {:error, :invalid_party}, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_call(:get_stats, _from, state) do
+    player_count = calculate_player_count(state)
+    private_stats = Map.put(state.stats, :player_count, player_count)
+
+    public_stats = %{
+      total_joined: private_stats.total_joined,
+      total_left: private_stats.total_left,
+      total_wait_time_s: private_stats.total_wait_time_s,
+      total_matched: private_stats.total_matched,
+      player_count: private_stats.player_count
+    }
+
+    {:reply, {:ok, public_stats}, state}
+  end
+
+  @impl GenServer
+  def handle_call({:leave_queue, player_id}, _from, state) do
+    case remove_player(player_id, state) do
+      :not_queued ->
+        {:reply, {:error, :not_queued}, state}
+
+      {:ok, state} ->
+        new_state = update_in(state, [:stats, :total_left], &(&1 + 1))
+        broadcast_update(new_state)
+        {:reply, :ok, new_state}
+    end
+  end
+
+  @doc """
+  The pairing room is gone for one reason or another
+  Rejoining the queue is not handled here, players will do that on their end
+  """
+  def handle_call({:disband_pairing, room_pid}, _from, state) do
+    case Enum.split_with(state.pairings, fn {p, _player_ids} -> p == room_pid end) do
+      {[{_pid, player_ids}], rest} ->
+        monitors =
+          demonitor_players(player_ids, state.monitors)
+          |> MC.demonitor_by_val({:room, room_pid, player_ids})
+
+        {:reply, :ok, %{state | pairings: rest, monitors: monitors}}
+
+      _other ->
+        {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:party_join_queue, version, _party_id, _member}, _from, state)
+      when state.queue.version != version,
+      do: {:reply, {:error, :version_mismatch}, state}
+
+  def handle_call({:party_join_queue, _version, party_id, member}, _from, state) do
+    cond do
+      length(member.player_ids) > state.queue.team_size ->
+        {:reply, {:error, :party_too_big}, state}
+
+      party_id in state.pending_parties ->
+        {:reply, {:error, :already_joined}, state}
+
+      true ->
+        # don't bother creating monitors for the players or the party
+        # since the entry gets removed after a short timeout.
+        state =
+          Map.update!(state, :pending_parties, fn p ->
+            tref = :timer.send_after(5000, {:cancel_party, party_id})
+
+            Map.put(p, party_id, %{
+              waiting_for: member.player_ids,
+              joined: [],
+              member: member,
+              sess_pids: [],
+              tref: tref
+            })
+          end)
+
+        {:reply, {:ok, self()}, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_info({:DOWN, ref, :process, _object, _reason}, state) do
+    val = MC.get_val(state.monitors, ref)
+    state = Map.update!(state, :monitors, &MC.demonitor_by_val(&1, val))
+
+    case val do
+      nil ->
+        {:noreply, state}
+
+      {:player, player_id} ->
+        Logger.debug("Player #{player_id} went down, removing from queue")
+
+        case remove_player(player_id, state) do
+          :not_queued -> {:noreply, state}
+          {:ok, state} -> {:noreply, state}
+        end
+
+      {:room, room_pid, player_ids} ->
+        Logger.info(
+          "pairing room went down #{inspect(room_pid)} with players: #{inspect(player_ids)}"
+        )
+
+        new_state =
+          Enum.reduce(player_ids, state, fn p_id, st ->
+            case remove_player(p_id, st) do
+              :not_queued -> st
+              {:ok, st} -> st
+            end
+          end)
+
+        {:noreply, new_state}
+    end
+  end
+
+  @impl GenServer
+  def handle_info(:tick, state), do: handle_info({:tick, DateTime.utc_now()}, state)
+
+  def handle_info({:tick, now}, state) do
+    new_state =
+      case match_members(state) do
+        :no_match ->
+          state
+
+        {:match, matches} ->
+          {pairings, monitors} =
+            Enum.reduce(matches, {[], state.monitors}, fn teams, {ts, monitors} ->
+              {:ok, pid} =
+                PairingRoom.start(state.id, state.queue, teams, state.settings.pairing_timeout)
+
+              player_ids =
+                for team <- teams, member <- team, player_id <- member.player_ids do
+                  player_id
+                end
+
+              monitors = MC.monitor(monitors, pid, {:room, pid, player_ids})
+
+              {[{pid, player_ids} | ts], monitors}
+            end)
+
+          matched_members =
+            for teams <- matches, team <- teams, member <- team do
+              member.id
+            end
+            |> MapSet.new()
+
+          new_members =
+            Enum.filter(state.members, fn m ->
+              not Enum.member?(matched_members, m.id)
+            end)
+
+          # Calculate total wait time for all matched members
+          total_wait_time =
+            for teams <- matches, team <- teams, member <- team do
+              DateTime.diff(now, member.joined_at, :second)
+            end
+            |> Enum.sum()
+
+          new_state =
+            state
+            |> Map.put(:members, new_members)
+            |> Map.replace!(:monitors, monitors)
+            |> Map.update(:pairings, pairings, fn ps -> pairings ++ ps end)
+            |> Map.update!(:stats, fn stats ->
+              stats
+              |> Map.update!(:total_matched, &(&1 + length(matches)))
+              |> Map.update!(:total_wait_time_s, &(&1 + total_wait_time))
+            end)
+
+          broadcast_update(new_state)
+          new_state
+      end
+
+    {:noreply, new_state}
+  end
+
+  def handle_info({:cancel_party, party_id}, state) do
+    case Map.get(state.pending_parties, party_id) do
+      nil ->
+        {:noreply, state}
+
+      pending ->
+        # a client failing to join should be infrequent, so log if that happens
+        Logger.info(
+          "Party #{party_id} failed to join, waiting for #{inspect(pending.waiting_for)}"
+        )
+
+        Enum.each(pending.joined, &Player.matchmaking_notify_cancelled(&1, :party_user_left))
+        state = %{state | pending_parties: Map.delete(state.pending_parties, party_id)}
+        {:noreply, state}
+    end
+  end
+
+  defp compute_version(engines, games, maps),
+    do: :erlang.phash2({engines, games, maps}) |> to_string()
+
+  defp remove_player(player_id, state) do
+    pending_party =
+      Enum.find(state.pending_parties, fn {_party_id, x} ->
+        Enum.any?(x.waiting_for, &(player_id == &1)) || Enum.any?(x.joined, &(player_id == &1))
+      end)
+
+    if pending_party == nil,
+      do: remove_member(player_id, state),
+      else: remove_from_pending_parties(player_id, pending_party, state)
+  end
+
+  defp remove_member(player_id, state) do
+    {to_remove, new_members} =
+      Enum.split_with(state.members, fn member ->
+        Enum.member?(member.player_ids, player_id)
+      end)
+
+    {pairing_to_remove, other_pairings} =
+      Enum.split_with(state.pairings, fn {_pid, members} ->
+        Enum.member?(members, player_id)
+      end)
+
+    case {to_remove, pairing_to_remove} do
+      {[], []} ->
+        :not_queued
+
+      {[to_remove], _pairing_to_remove} ->
+        monitors = demonitor_players(to_remove.player_ids, state.monitors)
+
+        for p_id when p_id != player_id <- to_remove.player_ids do
+          Player.matchmaking_notify_cancelled(p_id, :party_user_left)
+        end
+
+        {:ok, %{state | members: new_members, monitors: monitors}}
+
+      # there is no case with multiple member to remove since
+      # this is prevented when adding to a queue
+      {_to_remove, [{room_pid, canceled_members}]} ->
+        monitors = demonitor_players(canceled_members, state.monitors)
+        PairingRoom.cancel(room_pid, player_id)
+        {:ok, %{state | pairings: other_pairings, monitors: monitors}}
+    end
+  end
+
+  defp remove_from_pending_parties(player_id, {party_id, pending_party}, state) do
+    for p_id when p_id != player_id <- pending_party.waiting_for ++ pending_party.joined do
+      Player.matchmaking_notify_lost(p_id, :cancel)
+    end
+
+    Party.matchmaking_notify_cancel(party_id)
+    :timer.cancel(pending_party.tref)
+
+    Map.update!(state, :pending_parties, &Map.delete(&1, party_id))
+  end
+
+  @spec member_can_join_queue?([User.id()], state()) :: :ok | {:error, reason :: term()}
+  defp member_can_join_queue?(player_ids, state) do
+    member_ids =
+      Enum.flat_map(state.members, fn m -> m.player_ids end)
+      |> MapSet.new()
+
+    pairing_player_ids =
+      for {_pid, player_ids} <- state.pairings, p_id <- player_ids do
+        p_id
+      end
+      |> MapSet.new()
+
+    new_ids = MapSet.new(player_ids)
+    is_queuing = !MapSet.disjoint?(member_ids, new_ids)
+    is_pairing = !MapSet.disjoint?(pairing_player_ids, new_ids)
+
+    cond do
+      Enum.count(player_ids) > state.queue.team_size ->
+        {:error, :too_many_players}
+
+      Enum.empty?(state.queue.engines) ->
+        {:error, :missing_engines}
+
+      Enum.empty?(state.queue.games) ->
+        {:error, :missing_games}
+
+      Enum.empty?(state.queue.maps) ->
+        {:error, :missing_maps}
+
+      !is_queuing && !is_pairing ->
+        :ok
+
+      true ->
+        {:error, :already_queued}
+    end
+  end
+
+  defp add_member_to_queue(state, new_member, pids) do
+    monitors =
+      Enum.reduce(pids, state.monitors, fn {user_id, pid}, monitors ->
+        if pid != nil do
+          MC.monitor(monitors, pid, {:player, user_id})
+        else
+          monitors
+        end
+      end)
+
+    %{state | members: [new_member | state.members], monitors: monitors}
+  end
+
+  @doc """
+  This function shouldn't be public, but it's helpful for testing to export it
+  Ultimately, as the complexity grows, it could be exported to another module
+  dedicated to matching players, but for now this will do
+
+  This returns a list of potential matches.
+  A match is a list of teams, a team is a list of member
+  """
+  @spec match_members(state()) :: :no_match | {:match, [[[Member.t()]]]}
+  def match_members(state) do
+    {alg_module, alg_state} = state.queue.algo
+
+    apply(alg_module, :get_matches, [state.members, alg_state])
+  end
+
+  defp demonitor_players(player_ids, monitors) do
+    Enum.reduce(player_ids, monitors, fn player_id, monitors ->
+      MC.demonitor_by_val(monitors, {:player, player_id}, [:flush])
+    end)
+  end
+
+  @doc """
+  Get statistics for this queue
+  """
+  @spec get_stats(id()) :: {:ok, stats()} | {:error, :not_found}
+  def get_stats(queue_id) do
+    via_tuple = via_tuple(queue_id)
+    GenServer.call(via_tuple, :get_stats)
+  end
+
+  @spec calculate_player_count(state()) :: non_neg_integer()
+  defp calculate_player_count(state) do
+    Enum.sum_by(state.members, fn member -> length(member.player_ids) end)
+  end
+
+  @spec broadcast_update(state()) :: :ok
+  defp broadcast_update(state) do
+    player_count = calculate_player_count(state)
+    stats = Map.put(state.stats, :player_count, player_count)
+    Matchmaking.broadcast_queue_update(state.id, stats)
+  end
+end

@@ -1,0 +1,100 @@
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+name: Dialyzer
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# Sets the ENV `MIX_ENV` to `test` for running tests
+env:
+  MIX_ENV: test
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Dialyzer
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Read Elixir and Erlang versions from mise.toml
+      id: versions
+      run: |
+        echo "elixir=$(sed -n 's|elixir = \"\(.*\)\"|\1|p' mise.toml)" >> "$GITHUB_OUTPUT"
+        echo "erlang=$(sed -n 's|erlang = \"\(.*\)\"|\1|p' mise.toml)" >> "$GITHUB_OUTPUT"
+
+    - name: Setup Elixir and Erlang
+      uses: erlef/setup-beam@v1
+      with:
+        otp-version: ${{ steps.versions.outputs.erlang }}
+        elixir-version: ${{ steps.versions.outputs.elixir }}
+
+    # Step: Define how to cache deps. Restores existing cache if present.
+    - name: Cache deps
+      id: cache-deps
+      uses: actions/cache@v4
+      env:
+        cache-name: cache-elixir-deps
+      with:
+        path: deps
+        key: ${{ runner.os }}-mix-${{ env.cache-name }}-${{ hashFiles('**/mix.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-mix-${{ env.cache-name }}-
+
+    # Step: Define how to cache the `_build` directory. After the first run,
+    # this speeds up tests runs a lot. This includes not re-compiling our
+    # project's downloaded deps every run.
+    - name: Cache compiled build
+      id: cache-build
+      uses: actions/cache@v4
+      env:
+        cache-name: cache-compiled-build
+      with:
+        path: _build
+        key: ${{ runner.os }}-mix-${{ env.cache-name }}-${{ hashFiles('**/mix.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-mix-${{ env.cache-name }}-
+
+    # Step: Download project dependencies. If unchanged, uses
+    # the cached version.
+    - name: Install dependencies
+      run: mix deps.get
+
+    - name: Restore PLT cache
+      uses: actions/cache/restore@v3
+      id: plt_cache
+      with:
+        key: |
+          ${{ runner.os }}-${{ env.ELIXIR_VER }}-${{ env.OTP_VER }}-plt
+        restore-keys: |
+          ${{ runner.os }}-${{ env.ELIXIR_VER }}-${{ env.OTP_VER }}-plt
+        path: |
+          priv/plts
+
+    - name: Create PLTs
+      run: mix dialyzer --plt
+
+    - name: Save PLT cache
+      uses: actions/cache/save@v3
+      if: steps.plt_cache.outputs.cache-hit != 'true'
+      id: plt_cache_save
+      with:
+        key: |
+          ${{ runner.os }}-${{ env.ELIXIR_VER }}-${{ env.OTP_VER }}-plt
+        path: |
+          priv/plts
+
+    - name: Run dialyzer
+      run: mix dialyzer --list-unused-filters --format github

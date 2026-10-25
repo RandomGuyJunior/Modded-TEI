@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Beyond all Reason developer blog</title>
+    <link><%= ~p"/microblog" %></link>
+    <atom:link href="<%= ~p"/microblog" %>" rel="self" type="application/rss+xml" />
+    <description>Beyond all Reason developer blog </description>
+    <language>en</language>
+    <copyright>Copyright <%= DateTime.utc_now().year %> Beyond all Reason</copyright>
+    <lastBuildDate><%= @last_build_date |> format_date %></lastBuildDate>
+    <category>Computer gaming</category>
+    <ttl>60</ttl>
+
+    <%= for post <- @posts do %>
+      <%
+        {:safe, contents} = post.contents |> MDEx.to_html! |> raw
+      %>
+      <item>
+        <title><%= post.title |> html_escape |> safe_to_string %></title>
+        <author><%= post.poster.name |> html_escape |> safe_to_string %></author>
+        <posted_to><%= (if post.discord_channel, do: post.discord_channel.name, else: "none") |> html_escape |> safe_to_string %></posted_to>
+        <link><%= ~p"/microblog/show/#{post.id}" %></link>
+        <id><%= post.id %></id>
+        <guid><%= "#{post.id}/#{post.updated_at |> guid_date()}" %></guid>
+        <last_updated><%= post.updated_at |> format_date %></last_updated>
+        <description><%= "<![CDATA[#{post.summary |> html_escape |> safe_to_string}]]>" %></description>
+        <contents><%= "<![CDATA[#{contents}]]>" %></contents>
+        <tags><%= post.tags |> Enum.map(fn t -> t.name end) |> Enum.join(", ") |> html_escape |> safe_to_string %></tags>
+        <pubDate><%= post.inserted_at |> format_date %></pubDate>
+      </item>
+    <% end %>
+  </channel>
+</rss>

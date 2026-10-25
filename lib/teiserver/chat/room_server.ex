@@ -1,0 +1,240 @@
+defmodule Teiserver.Chat.RoomServer do
+  @moduledoc false
+  alias Phoenix.PubSub
+  alias Teiserver.Account.User
+  alias Teiserver.Chat
+  alias Teiserver.Chat.RoomRegistry
+  alias Teiserver.Data.Types, as: T
+  alias Teiserver.Helpers.MonitorCollection, as: MC
+
+  use GenServer, restart: :temporary
+
+  @type room :: %{
+          name: String.t(),
+          members: MapSet.t(User.id()),
+          author_id: User.id(),
+          topic: String.t(),
+          password: String.t(),
+          monitors: MC.t()
+        }
+
+  @typep state :: room()
+
+  @dont_log_room ~w(autohosts)
+
+  @spec get_room(String.t()) :: room() | nil
+  def get_room(name) do
+    name |> via_tuple() |> GenServer.call(:get_room)
+  catch
+    :exit, {:noproc, _details} -> nil
+  end
+
+  @spec join_room(String.t(), User.id(), pid() | nil) ::
+          {:ok, :joined | :already_present} | {:error, :invalid_room}
+  def join_room(name, user_id, pid \\ self()) do
+    name |> via_tuple() |> GenServer.call({:join_room, user_id, pid})
+  catch
+    :exit, {:noproc, _details} -> {:error, :invalid_room}
+  end
+
+  @spec leave_room(String.t(), User.id()) :: :ok
+  def leave_room(name, user_id) do
+    name |> via_tuple() |> GenServer.call({:leave_room, user_id})
+  catch
+    :exit, {:noproc, _details} -> :ok
+  end
+
+  @spec can_join_room?(String.t(), T.user()) :: true | :invalid_room | {false, String.t()}
+  def can_join_room?(name, user) do
+    name |> via_tuple() |> GenServer.call({:can_join_room?, user})
+  catch
+    :exit, {:noproc, _details} -> :invalid_room
+  end
+
+  @spec stop_room(String.t()) :: :ok
+  def stop_room(name) do
+    name |> via_tuple() |> GenServer.call(:stop)
+  catch
+    :exit, {:noproc, _details} -> :ok
+  end
+
+  @spec send_message(String.t(), User.id(), String.t()) :: :ok
+  def send_message(name, user_id, message) do
+    name |> via_tuple() |> GenServer.call({:send_message, user_id, message})
+  catch
+    :exit, {:noproc, _details} -> :ok
+  end
+
+  @spec send_message_ex(String.t(), User.id(), String.t()) :: :ok
+  def send_message_ex(name, user_id, message) do
+    name |> via_tuple() |> GenServer.call({:send_message_ex, user_id, message})
+  catch
+    :exit, {:noproc, _details} -> :ok
+  end
+
+  def start_link(args) do
+    GenServer.start_link(__MODULE__, args, name: via_tuple(args.name))
+  end
+
+  @impl GenServer
+  @spec init(term()) :: {:ok, state()}
+  def init(args) do
+    Logger.metadata(actor_type: :chat_room, actor_id: args.name)
+
+    state = %{
+      name: args.name,
+      # not a fan of having to join after creation, but let's keep the same API
+      members: MapSet.new(),
+      author_id: args.author_id,
+      topic: args.topic,
+      password: args.password,
+      monitors: MC.new()
+    }
+
+    update_member_count(state)
+
+    {:ok, state}
+  end
+
+  @impl GenServer
+  def handle_call(:get_room, _from, state) do
+    {:reply, state, state}
+  end
+
+  def handle_call({:join_room, userid, pid}, _from, state) do
+    if MapSet.member?(state.members, userid) do
+      {:reply, {:ok, :already_present}, state}
+    else
+      state =
+        state
+        |> Map.update!(:members, &MapSet.put(&1, userid))
+        |> Map.update!(:monitors, &MC.monitor(&1, pid, userid))
+
+      update_member_count(state)
+      {:reply, {:ok, :joined}, state}
+    end
+  end
+
+  def handle_call({:leave_room, userid}, _from, state) do
+    if MapSet.member?(state.members, userid) do
+      state =
+        state
+        |> Map.update!(:monitors, &MC.demonitor_by_val(&1, userid))
+        |> Map.update!(:members, &MapSet.delete(&1, userid))
+
+      PubSub.broadcast(
+        Teiserver.PubSub,
+        "room:#{state.name}",
+        {:remove_user_from_room, userid, state.name}
+      )
+
+      update_member_count(state)
+      {:reply, :ok, state}
+    else
+      {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:can_join_room?, _user}, _from, state) do
+    # Previously this checked for clans, we will leave it in place for now
+    # as the ability to limit membership to rooms is likely useful in the
+    # future
+    result = true
+
+    {:reply, result, state}
+  end
+
+  def handle_call(:stop, _from, state) do
+    {:stop, :shutdown, :ok, state}
+  end
+
+  def handle_call({:send_message, userid, message}, _from, state) do
+    if MapSet.member?(state.members, userid) do
+      msg_object =
+        if state.name in @dont_log_room do
+          nil
+        else
+          msg =
+            Chat.create_room_message(%{
+              content: message,
+              chat_room: state.name,
+              inserted_at: DateTime.utc_now(),
+              user_id: userid
+            })
+
+          case msg do
+            {:ok, msg_obj} -> msg_obj
+            _error -> nil
+          end
+        end
+
+      msg_id = if msg_object != nil, do: msg_object.id, else: nil
+
+      PubSub.broadcast(
+        Teiserver.PubSub,
+        "room_chat:#{state.name}",
+        %{
+          channel: "room_chat",
+          event: :message_received,
+          room_name: state.name,
+          id: msg_id,
+          content: message,
+          user_id: userid
+        }
+      )
+
+      PubSub.broadcast(
+        Teiserver.PubSub,
+        "room:#{state.name}",
+        {:new_message, userid, state.name, message}
+      )
+    end
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:send_message_ex, userid, message}, _from, state) do
+    if MapSet.member?(state.members, userid) do
+      if state.name not in @dont_log_room do
+        Chat.create_room_message(%{
+          content: message,
+          chat_room: state.name,
+          inserted_at: DateTime.utc_now(),
+          user_id: userid
+        })
+      end
+
+      PubSub.broadcast(
+        Teiserver.PubSub,
+        "room:#{state.name}",
+        {:new_message_ex, userid, state.name, message}
+      )
+    end
+
+    {:reply, :ok, state}
+  end
+
+  @impl GenServer
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
+    val = MC.get_val(state.monitors, ref)
+    state = Map.update!(state, :monitors, &MC.demonitor_by_val(&1, val))
+
+    case val do
+      nil ->
+        {:noreply, state}
+
+      userid ->
+        state = Map.update!(state, :members, &MapSet.delete(&1, userid))
+        update_member_count(state)
+        {:noreply, state}
+    end
+  end
+
+  defp update_member_count(state) do
+    RoomRegistry.update_room(state.name, Enum.count(state.members))
+  end
+
+  def via_tuple(name) do
+    RoomRegistry.via_tuple(name)
+  end
+end

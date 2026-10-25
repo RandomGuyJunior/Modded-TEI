@@ -1,0 +1,116 @@
+<% bsname = view_colour() %>
+
+<% timeframes = ["Today", "Yesterday", "7 days", "14 days", "31 days"] %>
+
+<TeiserverWeb.Telemetry.TelemetryComponents.sub_menu
+  active="complex_match_events"
+  view_colour={view_colour()}
+  current_user={@current_user}
+/>
+
+<div class="row section-menu">
+  <div class="col-md-12">
+    <div class={"card border-#{bsname}"}>
+      <div class="card-body">
+        {render(
+          TeiserverWeb.Telemetry.ComplexMatchEventView,
+          "section_menu.html",
+          Map.merge(assigns, %{
+            quick_search: "",
+            show_search: false,
+            active: "event_detail"
+          })
+        )}
+        <br /><br />
+
+        <%= for key <- @schema_keys do %>
+          <.section_menu_button
+            active={@key == key}
+            bsname={bsname}
+            url={"?key=#{key}&tf=#{@timeframe}"}
+          >
+            {key}
+          </.section_menu_button>
+        <% end %>
+        &nbsp;&nbsp;&nbsp;&nbsp;
+        &nbsp;&nbsp;&nbsp;&nbsp;
+        &nbsp;&nbsp;&nbsp;&nbsp;
+        <%= for tf <- timeframes do %>
+          <.section_menu_button
+            active={@timeframe == tf}
+            bsname={bsname}
+            url={"?key=#{@key}&tf=#{tf}"}
+          >
+            {tf}
+          </.section_menu_button>
+        <% end %>
+
+        <br /><br />
+
+        <%= if @match_data.aggregates && @match_data.aggregates != [] do %>
+          <h4>Value counts for {@event_name}</h4>
+          <table class="table table-sm">
+            <thead>
+              <tr>
+                <th><b>VALUE</b></th>
+                <th><b>COUNT</b></th>
+              </tr>
+            </thead>
+            <tbody>
+              <%= for %{value: key, count: count} <- @match_data.aggregates do %>
+                <tr>
+                  <td>{key}</td>
+                  <td>{count}</td>
+                </tr>
+              <% end %>
+            </tbody>
+          </table>
+        <% end %>
+
+        <%= if @match_data.events && @match_data.events != [] do %>
+          <h4>Event list for {@event_name}</h4>
+          <table class="table table-sm">
+            <thead>
+              <tr>
+                <%= for {key, _} <- Map.to_list(List.first(@match_data.events)) do %>
+                  <th><b>{String.upcase(key)}</b></th>
+                <% end %>
+              </tr>
+            </thead>
+            <tbody>
+              <%= for event <- @match_data.events do %>
+                <tr>
+                  <%= for {key, value} <- Map.to_list(event) do %>
+                    <td>
+                      <%= if key == "match" do %>
+                        <.link navigate={~p"/battle/#{value}"} class="btn btn-sm btn-secondary">
+                          <Fontawesome.icon icon={:show} style="solid" /> Show
+                        </.link>
+                      <% else %>
+                        <%= if is_list(value) and Enum.all?(value, &is_map/1) do %>
+                          <ul>
+                            <%= for map <- value do %>
+                              <li>
+                                <ul>
+                                  <%= for {k, v} <- map do %>
+                                    <li>{k}: {v}</li>
+                                  <% end %>
+                                </ul>
+                              </li>
+                            <% end %>
+                          </ul>
+                        <% else %>
+                          {value}
+                        <% end %>
+                      <% end %>
+                    </td>
+                  <% end %>
+                </tr>
+              <% end %>
+            </tbody>
+          </table>
+        <% end %>
+      </div>
+    </div>
+  </div>
+</div>

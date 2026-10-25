@@ -1,0 +1,182 @@
+defmodule TeiserverWeb.AdminDashLive.Index do
+  @moduledoc false
+  alias Phoenix.LiveView.Socket
+  alias Phoenix.PubSub
+  alias Teiserver
+  alias Teiserver.Admin.AdminLib
+  alias Teiserver.Battle
+  alias Teiserver.Battle.MatchMonitorServer
+  alias Teiserver.Bridge.BridgeServer
+  alias Teiserver.Bridge.DiscordSystem
+  alias Teiserver.Communication
+  alias Teiserver.Coordinator
+  alias Teiserver.Coordinator.AutomodServer
+
+  use TeiserverWeb, :live_view
+
+  @empty_telemetry_data %{
+    client: %{
+      total: 0,
+      player: 0,
+      spectator: 0
+    },
+    battle: %{
+      total: 0,
+      in_progress: 0
+    },
+    total_clients_connected: 0
+  }
+
+  @impl Phoenix.LiveView
+  def mount(_params, session, socket) do
+    telemetry_data =
+      Teiserver.cache_get(:application_temp_cache, :telemetry_data) || @empty_telemetry_data
+
+    socket =
+      socket
+      |> AuthPlug.live_call(session)
+      |> add_breadcrumb(name: "Admin", url: "/teiserver/admin")
+      |> add_breadcrumb(name: "Dashboard", url: "/admin/dashboard")
+      |> assign(:site_menu_active, "admin")
+      |> assign(:view_colour, AdminLib.colours())
+      |> assign(:telemetry_client, telemetry_data.client)
+      |> assign(:telemetry_battle, telemetry_data.battle)
+      |> assign(:total_connected_clients, telemetry_data.total_clients_connected)
+      |> assign(:use_discord, Communication.use_discord?())
+      |> update_lobbies()
+      |> update_server_pids()
+
+    :timer.send_interval(5_000, :tick)
+
+    {:ok, socket}
+  end
+
+  @impl Phoenix.LiveView
+  def handle_params(params, _url, socket) do
+    case allow?(socket.assigns[:current_user], "Moderator") do
+      true ->
+        {:noreply, apply_action(socket, socket.assigns.live_action, params)}
+
+      false ->
+        {:noreply,
+         socket
+         |> redirect(to: ~p"/")}
+    end
+  end
+
+  @impl Phoenix.LiveView
+  def handle_info(:tick, socket) do
+    {:noreply,
+     socket
+     |> update_lobbies()
+     |> update_server_pids()}
+  end
+
+  def handle_info(%{channel: "teiserver_telemetry", data: data}, socket) do
+    {:noreply,
+     socket
+     |> assign(:telemetry_loading, false)
+     |> assign(:telemetry_client, data.client)
+     |> assign(:telemetry_battle, data.battle)
+     |> assign(:total_connected_clients, data.total_clients_connected)}
+  end
+
+  @impl Phoenix.LiveView
+  def handle_event("check-consuls", _event, socket) do
+    Coordinator.start_all_consuls()
+    {:noreply, socket}
+  end
+
+  def handle_event("reinit-consuls", _event, socket) do
+    Battle.list_lobby_ids()
+    |> Enum.each(fn lobby_id ->
+      Coordinator.cast_consul(lobby_id, :reinit)
+    end)
+
+    {:noreply, socket}
+  end
+
+  def handle_event("check-balances", _event, socket) do
+    Coordinator.start_all_balancers()
+    {:noreply, socket}
+  end
+
+  def handle_event("reinit-balances", _event, socket) do
+    Battle.list_lobby_ids()
+    |> Enum.each(fn lobby_id ->
+      Coordinator.cast_balancer(lobby_id, :reinit)
+    end)
+
+    {:noreply, socket}
+  end
+
+  @spec handle_event(String.t(), map(), Socket.t()) :: {:noreply, Socket.t()}
+  def handle_event("restart-discord-bridge", _event, socket) do
+    username = socket.assigns[:current_user].name
+    restart_status = DiscordSystem.restart("manual restart from #{username}")
+
+    {flash_type, message} =
+      case restart_status do
+        {:ok, pid} when is_pid(pid) ->
+          {:info, "Discord Bridge restarted. Manual chat test recommended."}
+
+        :disabled ->
+          {:info, "Discord bridge is disabled"}
+
+        _other ->
+          {:error, "An unexpected status was received. Check logs"}
+      end
+
+    {:noreply, put_flash(socket, flash_type, message)}
+  end
+
+  @spec update_lobbies(Socket.t()) :: Socket.t()
+  defp update_lobbies(socket) do
+    lobbies =
+      Battle.list_lobby_ids()
+      |> Enum.map(fn lobby_id ->
+        consul_pid = Coordinator.get_consul_pid(lobby_id)
+        balancer_pid = Coordinator.get_balancer_pid(lobby_id)
+
+        throttle_pid =
+          case Registry.lookup(Teiserver.ThrottleRegistry, "LobbyThrottle:#{lobby_id}") do
+            [{pid, _value}] -> pid
+            _other -> nil
+          end
+
+        {Battle.get_lobby(lobby_id), consul_pid, balancer_pid, throttle_pid}
+      end)
+      |> Enum.sort_by(fn t -> elem(t, 0).name end, &<=/2)
+
+    socket
+    |> assign(:lobbies, lobbies)
+  end
+
+  @spec update_server_pids(Socket.t()) :: Socket.t()
+  defp update_server_pids(socket) do
+    lobby_id_server_pid =
+      case Registry.lookup(Teiserver.ServerRegistry, "LobbyIdServer") do
+        [{pid, _value}] -> pid
+        _other -> nil
+      end
+
+    server_pids = [
+      {"Lobby ID server", lobby_id_server_pid},
+      {"Coordinator", Coordinator.get_coordinator_pid()},
+      {"Match Monitor", MatchMonitorServer.get_match_monitor_pid()},
+      {"Automod", AutomodServer.get_automod_pid()},
+      {"Discord Bridge Bot", BridgeServer.get_bridge_pid()}
+    ]
+
+    socket
+    |> assign(:server_pids, server_pids)
+  end
+
+  defp apply_action(socket, :index, _params) do
+    :ok = PubSub.subscribe(Teiserver.PubSub, "teiserver_telemetry")
+
+    socket
+    |> assign(:page_title, "Admin dashboard")
+    |> assign(:client, nil)
+  end
+end

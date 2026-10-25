@@ -1,0 +1,38 @@
+<% recents = Teiserver.Account.RecentlyUsedCache.get_recently(@current_user) %>
+
+<%= if recents != [] do %>
+  <div class="nav-item dropdown mx-2">
+    <a
+      class="dropdown-toggle dropdown-toggle-icon-only"
+      href="#"
+      data-bs-toggle="dropdown"
+      aria-haspopup="true"
+      aria-expanded="false"
+      id="user-recents-link"
+    >
+      <i class="fa-solid fa-clock fa-fw fa-lg"></i>
+    </a>
+    <div
+      class="dropdown-menu dropdown-menu-end"
+      aria-labelledby="user-recents-link"
+      style="min-width: 300px; max-width: 500px;"
+    >
+      <span class="dropdown-header" style="font-weight: bold;">
+        Recent items
+      </span>
+
+      <%= for r <- Enum.take(recents, 15) do %>
+        <a class="dropdown-item" href={r.url}>
+          <i class={"fa-solid #{r.type_icon} fa-fw"} style={"color: #{r.type_colour}"}></i>
+
+          <%= if r.item_icon do %>
+            <i class={"fa-solid #{r.item_icon} fa-fw"} style={"color: #{r.item_colour}"}></i>
+          <% else %>
+            &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+          <% end %>
+          &nbsp; {r.item_label}
+        </a>
+      <% end %>
+    </div>
+  </div>
+<% end %>

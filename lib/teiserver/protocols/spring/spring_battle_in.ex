@@ -89,6 +89,20 @@ defmodule Teiserver.Protocols.Spring.BattleIn do
     state
   end
 
+  # Active Rapid mods are separate from merely downloaded archives.
+  # Only the authenticated battle host may publish this state.
+  def do_handle("mod_enabled", data, _msg_id,
+        %{lobby_id: lobby_id, lobby_host: true, userid: userid} = state)
+      when is_integer(lobby_id) and is_binary(data) and byte_size(data) <= 8192 do
+    tags = if data in ["", "-"], do: [], else: String.split(data, ",")
+    if length(tags) <= 128 and Enum.all?(tags, &Regex.match?(~r/\\A[A-Za-z0-9_-]+:[A-Za-z0-9_-]+\\z/, &1)) do
+      Coordinator.cast_consul(lobby_id, {:register_mod_enabled, userid, tags})
+    end
+    state
+  end
+
+  def do_handle("mod_enabled", _data, _msg_id, state), do: state
+
   def do_handle("mod_inventory", _data, _msg_id, state), do: state
 
   def do_handle("mod_capabilities", _data, _msg_id, state) do
